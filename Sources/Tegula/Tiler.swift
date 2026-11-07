@@ -1,0 +1,739 @@
+import AppKit
+import ApplicationServices
+
+final class TWin {
+    let id: CGWindowID
+    let el: AXUIElement
+    let pid: pid_t
+    let bundle: String
+    var display: String
+    var lastApplied = Date.distantPast
+    var expected = CGRect.zero
+    var snapCount = 0
+    var snapStamp = Date.distantPast
+    init(id: CGWindowID, el: AXUIElement, pid: pid_t, bundle: String, display: String) {
+        self.id = id; self.el = el; self.pid = pid; self.bundle = bundle; self.display = display
+    }
+}
+
+private let axCallback: AXObserverCallback = { _, el, note, _ in
+    Tiler.shared.axEvent(el, note as String)
+}
+
+/// KVO shim so we hear about Stage Manager being toggled without polling.
+private final class DefaultsKVO: NSObject {
+    let defaults: UserDefaults, key: String, cb: () -> Void
+    init(_ d: UserDefaults, _ key: String, _ cb: @escaping () -> Void) {
+        defaults = d; self.key = key; self.cb = cb
+        super.init()
+        d.addObserver(self, forKeyPath: key, options: [.new], context: nil)
+    }
+    override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) { cb() }
+}
+
+/// Owns window state and drives the layout engine. Entirely event-driven: AX observer callbacks,
+/// workspace notifications, hotkeys and one-shot debounce blocks. There are no repeating timers.
+final class Tiler {
+    static let shared = Tiler()
+
+    private(set) var wins: [CGWindowID: TWin] = [:]
+    private var tiles: [String: [[CGWindowID]]] = [:]       // per display: tiles, each a stack (last = top)
+    private var tileRects: [String: [CGRect]] = [:]         // full tile rects (AX coords)
+    private var observers: [pid_t: AXObserver] = [:]
+    private var observed: [CGWindowID: pid_t] = [:]
+    private var minSizes: [CGWindowID: CGSize] = [:]
+    private var userFloating = Set<CGWindowID>()
+    private(set) var activeID: CGWindowID?                  // focused AND tiled
+    private(set) var focusedRaw: CGWindowID?                // focused window, tiled or not
+
+    private var started = false
+    private var pendingPIDs = Set<pid_t>()
+    private var syncWork: DispatchWorkItem?
+    private var dirty = Set<String>()
+    private var retileWork: DispatchWorkItem?
+    private var stageKVO: DefaultsKVO?
+    private let stageDefaults = UserDefaults(suiteName: "com.apple.WindowManager")
+
+    private var dragID: CGWindowID?
+    private var dragCmd = false
+    private var mouseUpMonitor: Any?
+    private var hoverMonitor: Any?
+    private var hoverTile: (String, Int)?
+    private var hoverWork: DispatchWorkItem?
+    private var pendingSetup: (setup: Setup, deadline: Date)?
+
+    var trusted: Bool { AXIsProcessTrusted() }
+    var stageManagerOn: Bool { stageDefaults?.bool(forKey: "GloballyEnabled") ?? false }
+    var running: Bool { started && trusted && !Settings.shared.paused && !stageManagerOn }
+
+    // MARK: lifecycle
+
+    func start() {
+        guard !started, trusted else { return }
+        started = true
+        let ws = NSWorkspace.shared.notificationCenter
+        func on(_ n: Notification.Name, _ f: @escaping (Notification) -> Void) {
+            ws.addObserver(forName: n, object: nil, queue: .main, using: f)
+        }
+        func pidOf(_ n: Notification) -> pid_t? {
+            (n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier
+        }
+        on(NSWorkspace.didLaunchApplicationNotification) { [self] n in
+            guard running, let p = pidOf(n) else { return }
+            ensureObserver(p); scheduleSync(p)
+        }
+        on(NSWorkspace.didTerminateApplicationNotification) { [self] n in
+            guard let p = pidOf(n) else { return }
+            observers[p] = nil; scheduleSync(p)
+        }
+        on(NSWorkspace.didHideApplicationNotification) { [self] n in pidOf(n).map { scheduleSync($0) } }
+        on(NSWorkspace.didUnhideApplicationNotification) { [self] n in pidOf(n).map { scheduleSync($0) } }
+        on(NSWorkspace.didActivateApplicationNotification) { [self] _ in refreshActive() }
+        on(NSWorkspace.activeSpaceDidChangeNotification) { [self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.resyncAll() }
+        }
+        on(NSWorkspace.didWakeNotification) { [self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.resyncAll() }
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [self] _ in screensChanged() }
+        NotificationCenter.default.addObserver(forName: Settings.changed, object: nil, queue: .main) { [self] _ in settingsChanged() }
+        stageKVO = DefaultsKVO(stageDefaults ?? .standard, "GloballyEnabled") { [weak self] in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if self.stageManagerOn { Overlays.shared.hideAll() } else { self.resyncAll() }
+                NotificationCenter.default.post(name: Settings.changed, object: nil)
+            }
+        }
+        WindowAnimator.shared.touch = { [weak self] id in self?.wins[id]?.lastApplied = Date() }
+        WindowAnimator.shared.onFinish = { [weak self] id in
+            guard let self = self, let tw = self.wins[id], let f = tw.el.frame else { return }
+            let r = tw.expected
+            if f.width > r.width + 2 || f.height > r.height + 2 { self.verify.append((id, r, tw.display)); self.scheduleVerify() }
+        }
+        updateHoverMonitor()
+        resyncAll(initial: true)
+    }
+
+    // MARK: AX observers
+
+    private func ensureObserver(_ pid: pid_t) {
+        guard observers[pid] == nil, pid != getpid() else { return }
+        var obs: AXObserver?
+        guard AXObserverCreate(pid, axCallback, &obs) == .success, let o = obs else { return }
+        let app = AXUIElementCreateApplication(pid)
+        for n in [kAXWindowCreatedNotification, kAXFocusedWindowChangedNotification,
+                  kAXApplicationHiddenNotification, kAXApplicationShownNotification] {
+            AXObserverAddNotification(o, app, n as CFString, nil)
+        }
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(o), .defaultMode)
+        observers[pid] = o
+    }
+
+    private func observeWindow(_ w: AXUIElement, _ id: CGWindowID, _ pid: pid_t) {
+        guard observed[id] == nil, let o = observers[pid] else { return }
+        observed[id] = pid
+        for n in [kAXUIElementDestroyedNotification, kAXWindowMiniaturizedNotification, kAXWindowDeminiaturizedNotification,
+                  kAXWindowMovedNotification, kAXWindowResizedNotification] {
+            AXObserverAddNotification(o, w, n as CFString, nil)
+        }
+    }
+
+    fileprivate func axEvent(_ el: AXUIElement, _ note: String) {
+        guard started, !Settings.shared.paused else { return }
+        switch note {
+        case kAXFocusedWindowChangedNotification: refreshActive()
+        case kAXWindowMovedNotification, kAXWindowResizedNotification: geometryChanged(el)
+        default: scheduleSync(el.pid)
+        }
+    }
+
+    // MARK: sync
+
+    private func scheduleSync(_ pid: pid_t) {
+        pendingPIDs.insert(pid)
+        guard syncWork == nil else { return }
+        let w = DispatchWorkItem { [self] in
+            syncWork = nil
+            let pids = pendingPIDs; pendingPIDs.removeAll()
+            for p in pids { syncApp(p) }
+            flush()
+        }
+        syncWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: w)
+    }
+
+    func resyncAll(initial: Bool = false, reset: Bool = false) {
+        Log.d("resyncAll initial=\(initial) reset=\(reset)")
+        guard started else { return }
+        if reset { userFloating.removeAll(); minSizes.removeAll() }
+        guard running else { Overlays.shared.hideAll(); return }
+        let order = initial ? zOrder() : []
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+            ensureObserver(app.processIdentifier)
+        }
+        // Drop everything we think we know, then rediscover (keeps order when not resetting).
+        let pids = Set(NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }.map { $0.processIdentifier })
+        for p in pids { syncApp(p) }
+        for w in wins.values where !pids.contains(w.pid) { remove(w.id) }
+        if initial { reorder(by: order) }
+        if reset { for key in tiles.keys { tiles[key] = tiles[key]?.filter { !$0.isEmpty } } }
+        refreshActive(draw: false)
+        flushAll(animated: reset)
+    }
+
+    /// Front-to-back window ids, used once at startup so the frontmost windows get the biggest tiles.
+    private func zOrder() -> [CGWindowID] {
+        let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        return info.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value }
+    }
+
+    private func reorder(by z: [CGWindowID]) {
+        let rank = Dictionary(uniqueKeysWithValues: z.enumerated().map { ($1, $0) })
+        for key in tiles.keys {
+            let flat = (tiles[key] ?? []).flatMap { $0 }.sorted { (rank[$0] ?? 9999) < (rank[$1] ?? 9999) }
+            var fresh: [[CGWindowID]] = []
+            let cap = capacity(key)
+            for id in flat {
+                if fresh.count < cap { fresh.append([id]) } else { fresh[cap - 1].insert(id, at: 0) }
+            }
+            tiles[key] = fresh
+        }
+    }
+
+    private func eligible(_ w: AXUIElement, id: CGWindowID, bundle: String, hidden: Bool) -> Bool {
+        if hidden || userFloating.contains(id) || Settings.shared.excluded.contains(bundle) { return false }
+        guard w.string(kAXRoleAttribute) == kAXWindowRole, w.string(kAXSubroleAttribute) == kAXStandardWindowSubrole else { return false }
+        if w.bool(kAXMinimizedAttribute) == true || w.bool("AXFullScreen") == true { return false }
+        return w.isSettable(kAXPositionAttribute) && w.isSettable(kAXSizeAttribute)
+    }
+
+    private func syncApp(_ pid: pid_t) {
+        guard running else { return }
+        guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated,
+              app.activationPolicy == .regular, pid != getpid() else {
+            for w in wins.values where w.pid == pid { remove(w.id) }
+            for (id, p) in observed where p == pid { observed[id] = nil }
+            return
+        }
+        let bundle = app.bundleIdentifier ?? "pid.\(pid)"
+        let axApp = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(axApp, 0.3)
+        // A failed/timed-out read is NOT "no windows": keep what we know and try again on the next event.
+        var raw: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &raw) == .success else { return }
+        let list = (raw as? [AXUIElement]) ?? []
+        var present = Set<CGWindowID>()
+        let screens = ScreenInfo.all()
+        for w in list {
+            guard let id = w.windowID else { continue }
+            observeWindow(w, id, pid)
+            if wins[id] != nil {
+                // Already tiled: only a positive signal removes it (don't re-probe attributes that can time out).
+                if app.isHidden || userFloating.contains(id) || Settings.shared.excluded.contains(bundle)
+                    || w.bool(kAXMinimizedAttribute) == true || w.bool("AXFullScreen") == true { continue }
+                present.insert(id); continue
+            }
+            guard eligible(w, id: id, bundle: bundle, hidden: app.isHidden) else { continue }
+            present.insert(id)
+            if wins[id] == nil {
+                let f = w.frame ?? .zero
+                let c = CGPoint(x: f.midX, y: f.midY)
+                let key = (screens.first { $0.full.contains(c) } ?? screens.first { $0.full.contains(Geo.axMouse()) } ?? screens.first)?.key ?? ""
+                let tw = TWin(id: id, el: w, pid: pid, bundle: bundle, display: key)
+                wins[id] = tw
+                place(tw)
+            }
+        }
+        for w in wins.values where w.pid == pid && !present.contains(w.id) { remove(w.id) }
+        for (id, p) in observed where p == pid && !list.contains(where: { $0.windowID == id }) { observed[id] = nil; minSizes[id] = nil }
+        if pendingSetup != nil { applyPendingSetup() }
+    }
+
+    private func capacity(_ key: String) -> Int {
+        ScreenInfo.all().first { $0.key == key }?.capacity ?? 4
+    }
+
+    private func place(_ tw: TWin) {
+        var t = tiles[tw.display] ?? []
+        if t.count < capacity(tw.display) {
+            t.append([tw.id])
+        } else {
+            let idx = activeID.flatMap { a in t.firstIndex { $0.contains(a) } } ?? t.count - 1
+            t[idx].append(tw.id)
+        }
+        tiles[tw.display] = t
+        dirty.insert(tw.display)
+    }
+
+    private func remove(_ id: CGWindowID) {
+        guard let tw = wins.removeValue(forKey: id) else { return }
+        for key in tiles.keys {
+            tiles[key] = tiles[key]?.map { $0.filter { $0 != id } }.filter { !$0.isEmpty }
+        }
+        minSizes[id] = nil
+        dirty.insert(tw.display)
+    }
+
+    private func rebalance(_ t: inout [[CGWindowID]], cap: Int) {
+        while t.count > cap, t.count > 1 { let x = t.removeLast(); t[t.count - 1] += x }
+        while t.count < cap, let i = t.firstIndex(where: { $0.count > 1 }) {
+            t.append([t[i].removeFirst()])
+        }
+    }
+
+    // MARK: retile
+
+    private func flush(animated: Bool = true) {
+        let keys = dirty; dirty.removeAll()
+        for k in keys { retile(k, animated: animated) }
+        refreshActive(draw: false); publish(animated: animated)
+    }
+    private func flushAll(animated: Bool = true) { for s in ScreenInfo.all() { dirty.insert(s.key) }; flush(animated: animated) }
+
+    func scheduleRetileAll() {
+        guard retileWork == nil else { return }
+        let w = DispatchWorkItem { [self] in retileWork = nil; flushAll() }
+        retileWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: w)
+    }
+
+    private func tileMin(_ ids: [CGWindowID]) -> CGSize {
+        var s = CGSize.zero
+        for id in ids { if let m = minSizes[id] { s.width = max(s.width, m.width); s.height = max(s.height, m.height) } }
+        return s
+    }
+
+    private func retile(_ key: String, animated: Bool = true) {
+        guard running, let scr = ScreenInfo.all().first(where: { $0.key == key }) else { return }
+        let set = Settings.shared
+        var work = (tiles[key] ?? []).map { $0.filter { wins[$0] != nil } }.filter { !$0.isEmpty }
+        rebalance(&work, cap: scr.capacity)
+        guard !work.isEmpty else { tiles[key] = []; tileRects[key] = []; return }
+
+        let gap = set.gap
+        let avail = scr.usable.insetBy(dx: gap, dy: gap)
+        let kind = set.layout(for: key)
+        var rects: [CGRect] = []
+        var floated: [CGWindowID] = []
+        while true {
+            let mins = work.map { tileMin($0) }
+            let tree = LayoutEngine.tree(kind: kind, count: work.count, ratio: set.mainRatio, ultrawide: scr.ultrawide, vertical: scr.vertical)
+            rects = LayoutEngine.solve(tree, in: avail, gap: gap, mins: mins, count: work.count)
+            let needW = LayoutEngine.minExtent(tree, .horizontal, gap: gap, mins: mins)
+            let needH = LayoutEngine.minExtent(tree, .vertical, gap: gap, mins: mins)
+            if work.count == 1 && work[0].count == 1 { break }
+            if needW <= Double(avail.width) + 0.5 && needH <= Double(avail.height) + 0.5 { break }
+            // Won't fit: float the single hungriest window of the hungriest tile (never a whole stack).
+            func area(_ id: CGWindowID) -> CGFloat { (minSizes[id]?.width ?? 0) * (minSizes[id]?.height ?? 0) }
+            let worst = mins.indices.max { mins[$0].width * mins[$0].height < mins[$1].width * mins[$1].height }!
+            guard let victim = work[worst].max(by: { area($0) < area($1) }) else { break }
+            floated.append(victim)
+            work[worst].removeAll { $0 == victim }
+            if work[worst].isEmpty { work.remove(at: worst) }
+            if work.isEmpty { break }
+        }
+        tiles[key] = work
+        tileRects[key] = rects
+        // Windows that cannot fit any tile float, centred.
+        for id in floated {
+            guard let tw = wins[id], let f = tw.el.frame else { continue }
+            let size = CGSize(width: min(f.width, avail.width), height: min(f.height, avail.height))
+            tw.lastApplied = Date()
+            tw.el.setPosition(CGPoint(x: avail.midX - size.width / 2, y: avail.midY - size.height / 2))
+            userFloating.insert(id)   // stays out of the layout until "Retile All"
+        }
+        let strip = set.tabView ? TabStripLayout.height : 0
+        for (i, ids) in work.enumerated() {
+            var r = rects[i]
+            if ids.count > 1 && strip > 0 { r.origin.y += strip; r.size.height -= strip }
+            for id in ids { apply(id, r, display: key, animated: animated) }
+        }
+        Log.d("retile \(key) \(kind.rawValue) ultra=\(scr.ultrawide) tiles=\(work.map { $0.count }) floated=\(floated.count) rects=\(rects.map { "\(Int($0.minX)),\(Int($0.minY)) \(Int($0.width))x\(Int($0.height))" })")
+        scheduleVerify()
+    }
+
+    private var verify: [(id: CGWindowID, want: CGRect, display: String)] = []
+    private var verifyWork: DispatchWorkItem?
+
+    private func near(_ a: CGRect, _ b: CGRect) -> Bool {
+        abs(a.minX - b.minX) < 1.5 && abs(a.minY - b.minY) < 1.5 && abs(a.width - b.width) < 1.5 && abs(a.height - b.height) < 1.5
+    }
+
+    /// Moves (or glides) a window to `r`. Windows that didn't reach `r` are re-checked once, shortly after:
+    /// apps like Electron resize asynchronously, so an immediate read-back would teach a false minimum.
+    private func apply(_ id: CGWindowID, _ r: CGRect, display: String, animated: Bool) {
+        guard let tw = wins[id] else { return }
+        tw.expected = r
+        let anim = WindowAnimator.shared
+        if let t = anim.target(id), near(t, r) { return }                 // already gliding there
+        let running = anim.current(id)
+        guard let cur = running ?? tw.el.frame else { return }
+        if running == nil && near(cur, r) { return }
+        tw.lastApplied = Date()
+        if animated && Motion.enabled {
+            anim.move(id, el: tw.el, pid: tw.pid, from: cur, to: r)
+            return
+        }
+        anim.cancel(id)
+        tw.el.setFrame(r)
+        if let f = tw.el.frame, f.width > r.width + 2 || f.height > r.height + 2 { verify.append((id, r, display)) }
+    }
+
+    private func scheduleVerify() {
+        guard !verify.isEmpty, verifyWork == nil else { return }
+        let w = DispatchWorkItem { [self] in
+            verifyWork = nil
+            let items = verify; verify.removeAll()
+            var changed = Set<String>()
+            for it in items {
+                guard let tw = wins[it.id], let f = tw.el.frame else { continue }
+                let wOver = f.width > it.want.width + 2, hOver = f.height > it.want.height + 2
+                guard wOver || hOver else { continue }
+                let old = minSizes[it.id] ?? .zero
+                let new = CGSize(width: wOver ? max(old.width, f.width) : old.width, height: hOver ? max(old.height, f.height) : old.height)
+                if new != old { minSizes[it.id] = new; changed.insert(it.display) }
+            }
+            for k in changed { dirty.insert(k) }
+            if !changed.isEmpty { flush() }
+        }
+        verifyWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: w)
+    }
+
+    // MARK: overlays
+
+    private func publish(animated: Bool = false) {
+        var infos: [TileInfo] = []
+        for (key, list) in tiles {
+            let rects = tileRects[key] ?? []
+            for (i, ids) in list.enumerated() where i < rects.count {
+                infos.append(TileInfo(key: key, index: i, rect: rects[i], ids: ids))
+            }
+        }
+        Overlays.shared.refresh(tiles: infos, active: activeID, focused: focusedRaw, animated: animated)
+    }
+
+    func refreshActive(draw: Bool = true) {
+        var raw: CGWindowID?
+        if let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() {
+            let ax = AXUIElementCreateApplication(app.processIdentifier)
+            AXUIElementSetMessagingTimeout(ax, 0.2)
+            raw = ax.element(kAXFocusedWindowAttribute)?.windowID
+        } else if NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid() {
+            return
+        }
+        focusedRaw = raw
+        activeID = raw.flatMap { wins[$0] != nil ? $0 : nil }
+        if let a = activeID {   // keep the focused window on top of its stack
+            for key in tiles.keys {
+                guard var t = tiles[key], let i = t.firstIndex(where: { $0.contains(a) }) else { continue }
+                if t[i].last != a { t[i].removeAll { $0 == a }; t[i].append(a); tiles[key] = t }
+            }
+        }
+        if draw { publish() }
+    }
+
+    // MARK: user-driven moves
+
+    private func geometryChanged(_ el: AXUIElement) {
+        guard running, let id = el.windowID, let tw = wins[id] else { return }
+        if Date().timeIntervalSince(tw.lastApplied) < 0.35 { return }
+        if NSEvent.pressedMouseButtons & 1 != 0 {
+            dragID = id
+            if NSEvent.modifierFlags.contains(.command) { dragCmd = true }
+            if mouseUpMonitor == nil {
+                mouseUpMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [weak self] _ in self?.finishDrag() }
+            }
+            return
+        }
+        // The app moved/resized itself (or something else did): snap back, but not in a fight loop.
+        guard let f = el.frame else { return }
+        let e = tw.expected
+        if abs(f.minX - e.minX) < 3, abs(f.minY - e.minY) < 3, abs(f.width - e.width) < 3, abs(f.height - e.height) < 3 { return }
+        if Date().timeIntervalSince(tw.snapStamp) > 1.5 { tw.snapCount = 0 }
+        tw.snapStamp = Date(); tw.snapCount += 1
+        if tw.snapCount <= 3 { dirty.insert(tw.display); scheduleRetileAll() }
+    }
+
+    private func finishDrag() {
+        if let m = mouseUpMonitor { NSEvent.removeMonitor(m); mouseUpMonitor = nil }
+        let cmd = dragCmd || NSEvent.modifierFlags.contains(.command)
+        dragCmd = false
+        defer { scheduleRetileAll() }
+        guard let id = dragID, let tw = wins[id] else { dragID = nil; return }
+        dragID = nil
+        let p = Geo.axMouse()
+        let screens = ScreenInfo.all()
+        guard let target = screens.first(where: { $0.full.contains(p) }) else { return }
+        dirty.insert(tw.display); dirty.insert(target.key)
+        if cmd, let (key, idx) = tileAt(p), let other = tiles[key]?[idx].last, other != id {
+            swap(id, other)
+        } else if target.key != tw.display {
+            move(id, toDisplay: target.key)
+        }
+    }
+
+    private func tileAt(_ p: CGPoint) -> (String, Int)? {
+        for (key, rs) in tileRects { for (i, r) in rs.enumerated() where r.contains(p) { return (key, i) } }
+        return nil
+    }
+
+    private func locate(_ id: CGWindowID) -> (key: String, tile: Int, slot: Int)? {
+        for (key, t) in tiles { for (i, stack) in t.enumerated() { if let s = stack.firstIndex(of: id) { return (key, i, s) } } }
+        return nil
+    }
+
+    private func swap(_ a: CGWindowID, _ b: CGWindowID) {
+        guard let la = locate(a), let lb = locate(b) else { return }
+        tiles[la.key]![la.tile][la.slot] = b
+        tiles[lb.key]![lb.tile][lb.slot] = a
+        wins[a]?.display = lb.key; wins[b]?.display = la.key
+        dirty.insert(la.key); dirty.insert(lb.key)
+    }
+
+    private func move(_ id: CGWindowID, toDisplay key: String) {
+        guard let tw = wins[id] else { return }
+        let old = tw.display
+        for k in tiles.keys { tiles[k] = tiles[k]?.map { $0.filter { $0 != id } }.filter { !$0.isEmpty } }
+        tw.display = key
+        place(tw)
+        dirty.insert(old); dirty.insert(key)
+    }
+
+    // MARK: actions
+
+    func focus(_ id: CGWindowID) {
+        guard let tw = wins[id] else { return }
+        let app = AXUIElementCreateApplication(tw.pid)
+        tw.el.raise()
+        AXUIElementSetAttributeValue(tw.el, kAXMainAttribute as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(app, kAXFocusedWindowAttribute as CFString, tw.el)
+        AXUIElementSetAttributeValue(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        NSRunningApplication(processIdentifier: tw.pid)?.activate()
+    }
+
+    /// Display the user is working on: focused window's, else the mouse's.
+    func currentDisplay() -> String? {
+        if let id = activeID, let w = wins[id] { return w.display }
+        let screens = ScreenInfo.all()
+        return (screens.first { $0.full.contains(Geo.axMouse()) } ?? screens.first)?.key
+    }
+
+    func setLayout(_ k: LayoutKind, display: String? = nil) {
+        guard let key = display ?? currentDisplay() else { return }
+        Settings.shared.setLayout(k, for: key)   // settingsChanged() retiles
+    }
+
+    func togglePause() {
+        Settings.shared.paused.toggle()
+        if !Settings.shared.paused { resyncAll() }
+    }
+
+    func swapInDirection(_ dx: Int, _ dy: Int) {
+        guard running, let id = activeID, let loc = locate(id), let rects = tileRects[loc.key], loc.tile < rects.count else { return }
+        let me = rects[loc.tile]
+        let c = CGPoint(x: me.midX, y: me.midY)
+        var best: (Int, CGFloat)?
+        for (i, r) in rects.enumerated() where i != loc.tile {
+            let d = CGPoint(x: r.midX - c.x, y: r.midY - c.y)
+            let along = CGFloat(dx) * d.x + CGFloat(dy) * d.y
+            let across = abs(CGFloat(dy) * d.x) + abs(CGFloat(dx) * d.y)
+            guard along > 4 else { continue }
+            let score = along + 2 * across
+            if best == nil || score < best!.1 { best = (i, score) }
+        }
+        if let (i, _) = best, let other = tiles[loc.key]?[i].last {
+            swap(id, other)
+        } else {
+            // past the screen edge: hop to the neighbouring display
+            let screens = ScreenInfo.all()
+            guard let cur = screens.first(where: { $0.key == loc.key }) else { return }
+            let cc = CGPoint(x: cur.full.midX, y: cur.full.midY)
+            let next = screens.filter { $0.key != loc.key }.compactMap { s -> (ScreenInfo, CGFloat)? in
+                let d = CGPoint(x: s.full.midX - cc.x, y: s.full.midY - cc.y)
+                let along = CGFloat(dx) * d.x + CGFloat(dy) * d.y
+                return along > 0 ? (s, along + 2 * (abs(CGFloat(dy) * d.x) + abs(CGFloat(dx) * d.y))) : nil
+            }.min { $0.1 < $1.1 }
+            guard let target = next?.0 else { return }
+            move(id, toDisplay: target.key)
+        }
+        flush()
+        focus(id)
+    }
+
+    func makeMain(_ id: CGWindowID? = nil) {
+        guard let id = id ?? activeID, let loc = locate(id), let main = tiles[loc.key]?.first?.last, main != id else { return }
+        swap(id, main); flush(); focus(id)
+    }
+
+    func floatWindow(_ id: CGWindowID) {
+        userFloating.insert(id)
+        if let tw = wins[id] { remove(id); dirty.insert(tw.display) }
+        flush()
+    }
+
+    func closeWindow(_ id: CGWindowID) { wins[id]?.el.press(kAXCloseButtonAttribute) }
+
+    func toggleTile(bundle: String) {
+        var ex = Settings.shared.excluded
+        if let i = ex.firstIndex(of: bundle) { ex.remove(at: i) } else { ex.append(bundle) }
+        Settings.shared.excluded = ex
+        resyncAll()
+    }
+
+    func cleanSpace() {
+        let tiled = Set(wins.values.map { $0.pid })
+        var hidden: [String] = []
+        for app in NSWorkspace.shared.runningApplications
+        where app.activationPolicy == .regular && app.processIdentifier != getpid() && !tiled.contains(app.processIdentifier)
+            && !app.isHidden && app.bundleIdentifier != "com.apple.finder" {
+            hidden.append("\(app.bundleIdentifier ?? "?"):\(app.hide())")
+        }
+        Log.d("cleanSpace tiledPIDs=\(tiled.count) hid=\(hidden)")
+    }
+
+    func cycleFocusMode() {
+        let all = FocusMode.allCases
+        let next = all[(all.firstIndex(of: Settings.shared.focusMode)! + 1) % all.count]
+        Settings.shared.focusMode = next
+    }
+
+    // MARK: settings / screens
+
+    private func settingsChanged() {
+        guard started else { return }
+        updateHoverMonitor()
+        if running { scheduleRetileAll() } else { Overlays.shared.hideAll() }
+    }
+
+    private func screensChanged() {
+        let keys = Set(ScreenInfo.all().map { $0.key })
+        let home = ScreenInfo.all().first?.key ?? ""
+        for tw in wins.values where !keys.contains(tw.display) { tw.display = home }
+        for k in tiles.keys where !keys.contains(k) {
+            for stack in tiles[k] ?? [] { for id in stack { if let tw = wins[id] { place(tw) } } }
+            tiles[k] = nil; tileRects[k] = nil
+        }
+        scheduleRetileAll()
+    }
+
+    // MARK: hover-to-activate (installed only while the option is on)
+
+    private func updateHoverMonitor() {
+        let want = Settings.shared.hoverActivate && running
+        if want, hoverMonitor == nil {
+            hoverMonitor = NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { [weak self] _ in self?.hoverMoved() }
+        } else if !want, let m = hoverMonitor {
+            NSEvent.removeMonitor(m); hoverMonitor = nil; hoverTile = nil
+        }
+    }
+
+    private func hoverMoved() {
+        guard NSEvent.pressedMouseButtons == 0 else { return }
+        let p = Geo.axMouse()
+        guard let t = tileAt(p) else { return }
+        if let h = hoverTile, h == t { return }
+        hoverTile = t
+        hoverWork?.cancel()
+        let w = DispatchWorkItem { [self] in
+            guard let top = tiles[t.0]?[safe: t.1]?.last, top != activeID, tileAt(Geo.axMouse()).map({ $0 == t }) == true else { return }
+            focus(top)
+        }
+        hoverWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: w)
+    }
+
+    // MARK: setups
+
+    func captureSetup(name: String) -> Setup {
+        var ds: [DisplaySetup] = []
+        for (key, list) in tiles where !list.isEmpty {
+            let tilesB = list.map { stack -> [String] in
+                var seen: [String] = []
+                for id in stack { if let b = wins[id]?.bundle, !seen.contains(b) { seen.append(b) } }
+                return seen
+            }
+            ds.append(DisplaySetup(display: key, layout: Settings.shared.layout(for: key).rawValue, tiles: tilesB))
+        }
+        return Setup(id: UUID().uuidString, name: name, displays: ds, shortcut: nil)
+    }
+
+    func launchSetup(_ s: Setup) {
+        guard running else { return }
+        let wanted = Set(s.displays.flatMap { $0.tiles.flatMap { $0 } })
+        for d in s.displays { if let k = LayoutKind(rawValue: d.layout) { Settings.shared.setLayout(k, for: d.display) } }
+        for b in wanted {
+            if let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == b }) {
+                if app.isHidden { app.unhide() }
+            } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: b) {
+                let cfg = NSWorkspace.OpenConfiguration(); cfg.activates = false
+                NSWorkspace.shared.openApplication(at: url, configuration: cfg)
+            }
+        }
+        for app in NSWorkspace.shared.runningApplications
+        where app.activationPolicy == .regular && app.processIdentifier != getpid() && !app.isHidden
+            && app.bundleIdentifier != "com.apple.finder" && !wanted.contains(app.bundleIdentifier ?? "") { app.hide() }
+        pendingSetup = (s, Date().addingTimeInterval(15))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [self] in
+            resyncAll()
+            applyPendingSetup()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [self] in
+                if let p = pendingSetup, p.deadline <= Date() { pendingSetup = nil }
+            }
+        }
+    }
+
+    private func applyPendingSetup() {
+        guard let (s, deadline) = pendingSetup else { return }
+        if Date() > deadline { pendingSetup = nil; return }
+        let screens = Set(ScreenInfo.all().map { $0.key })
+        var used = Set<CGWindowID>()
+        var satisfied = true
+        for d in s.displays where screens.contains(d.display) {
+            var result: [[CGWindowID]] = []
+            for bundles in d.tiles {
+                var ids: [CGWindowID] = []
+                for b in bundles {
+                    let mine = wins.values.filter { $0.bundle == b && !used.contains($0.id) }.map { $0.id }.sorted()
+                    if mine.isEmpty { satisfied = false }
+                    ids += mine
+                }
+                used.formUnion(ids)
+                if !ids.isEmpty { result.append(ids) }
+            }
+            for id in result.flatMap({ $0 }) { wins[id]?.display = d.display }
+            for old in tiles.keys where old != d.display { tiles[old] = tiles[old]?.map { $0.filter { !result.flatMap { $0 }.contains($0) } }.filter { !$0.isEmpty } }
+            tiles[d.display] = result
+            dirty.insert(d.display)
+        }
+        if satisfied { pendingSetup = nil }
+        flush()
+    }
+
+    // MARK: diagnostics
+
+    func dump() {
+        print("trusted:", trusted, " stageManager:", stageManagerOn)
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+            let ax = AXUIElementCreateApplication(app.processIdentifier)
+            for w in ax.elements(kAXWindowsAttribute) {
+                let ok = eligible(w, id: w.windowID ?? 0, bundle: app.bundleIdentifier ?? "", hidden: app.isHidden)
+                print(ok ? "TILE " : "skip ", app.bundleIdentifier ?? "?", w.windowID ?? 0, w.frame.map { "\($0)" } ?? "-")
+            }
+        }
+    }
+}
+
+extension Array { subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil } }
+
+/// Opt-in diagnostics: `defaults write com.aakarsh.tegula debugLog -bool true` → ~/Library/Logs/Tegula.log
+enum Log {
+    static let on = UserDefaults.standard.bool(forKey: "debugLog")
+    static func d(_ s: @autoclosure () -> String) {
+        guard on else { return }
+        let path = NSHomeDirectory() + "/Library/Logs/Tegula.log"
+        let line = "\(Date()) \(s())\n"
+        if let h = FileHandle(forWritingAtPath: path) { h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); try? h.close() }
+        else { try? line.write(toFile: path, atomically: true, encoding: .utf8) }
+    }
+}
