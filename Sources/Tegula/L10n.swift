@@ -10,7 +10,7 @@ enum S: String {
     case tabView, hoverActivate, quickActions, excludedApps, noExcluded, remove, addApp, notSet, pressKeys
     case conflictTitle, conflictBody, useInstead, cancel, setupName, save, rename, reset, setupsHint
     case swapLeft, swapRight, swapUp, swapDown, makeMain, floatWin, closeWin, paused, aboutText
-    case animate, makeMainAction, setupSaved, slateIcon, clayIcon, layout, needMod, restartNote
+    case close, minimize, editMenu, cut, copy, paste, selectAll, windowMenu, animate, makeMainAction, setupSaved, slateIcon, clayIcon, layout, needMod, restartNote
 }
 
 enum L10n {
@@ -90,6 +90,14 @@ enum L10n {
         .borderAll: ["All borders", "Todos los bordes", "すべての枠", "모든 테두리", "全部边框"],
         .borderGlow: ["Glow", "Resplandor", "グロー", "글로우", "发光"],
         .borderColor: ["Border color", "Color del borde", "枠の色", "테두리 색상", "边框颜色"],
+        .close: ["Close", "Cerrar", "閉じる", "닫기", "关闭"],
+        .minimize: ["Minimize", "Minimizar", "しまう", "최소화", "最小化"],
+        .editMenu: ["Edit", "Edición", "編集", "편집", "编辑"],
+        .cut: ["Cut", "Cortar", "カット", "잘라내기", "剪切"],
+        .copy: ["Copy", "Copiar", "コピー", "복사", "拷贝"],
+        .paste: ["Paste", "Pegar", "ペースト", "붙여넣기", "粘贴"],
+        .selectAll: ["Select All", "Seleccionar todo", "すべてを選択", "전체 선택", "全选"],
+        .windowMenu: ["Window", "Ventana", "ウインドウ", "윈도우", "窗口"],
         .animate: ["Animate window movement", "Animar el movimiento de ventanas", "ウィンドウの移動をアニメーション表示", "창 이동 애니메이션", "窗口移动动画"],
         .tabView: ["Tab View for stacked windows", "Vista de pestañas para ventanas apiladas", "重なったウィンドウをタブ表示", "겹친 창 탭 보기", "为堆叠窗口显示标签页"],
         .hoverActivate: ["Activate windows on hover", "Activar ventanas al pasar el ratón", "ホバーでウィンドウをアクティブ化", "마우스 오버 시 창 활성화", "悬停时激活窗口"],

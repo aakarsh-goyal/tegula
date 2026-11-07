@@ -1,5 +1,13 @@
 import AppKit
 
+/// Debug hooks: with `debugLog` on, `notifyutil -p com.aakarsh.tegula.dump` logs the tiler's state and
+/// `notifyutil -p com.aakarsh.tegula.do.<action>` runs a shortcut action, so behaviour can be tested headlessly.
+private var debugHandlers: [String: () -> Void] = [:]
+private let darwinCallback: CFNotificationCallback = { _, _, name, _, _ in
+    guard let n = name?.rawValue as String? else { return }
+    DispatchQueue.main.async { debugHandlers[n]?() }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var menu: MenuController!
 
@@ -11,7 +19,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// An accessory app has no visible menu bar, but its key equivalents (⌘W, ⌘Q, ⌘, ⌘C/⌘V…) still need a
+    /// main menu to exist, otherwise the Settings window can't be closed from the keyboard.
+    private func installMainMenu() {
+        let main = NSMenu()
+        func submenu(_ title: String) -> NSMenu {
+            let item = NSMenuItem(); main.addItem(item)
+            let m = NSMenu(title: title); item.submenu = m
+            return m
+        }
+        let app = submenu("Tegula")
+        app.addItem(withTitle: L10n.t(.settings), action: #selector(openSettingsFromMenu), keyEquivalent: ",").target = self
+        app.addItem(.separator())
+        app.addItem(withTitle: L10n.t(.quit), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+
+        let edit = submenu(L10n.t(.editMenu))
+        edit.addItem(withTitle: L10n.t(.cut), action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: L10n.t(.copy), action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: L10n.t(.paste), action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: L10n.t(.selectAll), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+
+        let win = submenu(L10n.t(.windowMenu))
+        win.addItem(withTitle: L10n.t(.close), action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        win.addItem(withTitle: L10n.t(.minimize), action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        NSApp.mainMenu = main
+        NSApp.windowsMenu = win
+    }
+
+    @objc private func openSettingsFromMenu() { SettingsWindowController.shared.show() }
+
     func applicationDidFinishLaunching(_ n: Notification) {
+        installMainMenu()
         AppDelegate.applyTheme()
         Icons.applyAppIcon()
         menu = MenuController()
@@ -22,6 +60,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Hotkeys.shared.reload()
         NotificationCenter.default.addObserver(forName: Settings.changed, object: nil, queue: .main) { _ in
             AppDelegate.applyTheme()
+        }
+
+        if Log.on {
+            let center = CFNotificationCenterGetDarwinNotifyCenter()
+            func listen(_ name: String, _ f: @escaping () -> Void) {
+                debugHandlers[name] = f
+                CFNotificationCenterAddObserver(center, nil, darwinCallback, name as CFString, nil, .deliverImmediately)
+            }
+            listen("com.aakarsh.tegula.dump") { Tiler.shared.debugDump() }
+            // Posts ⌘W, but ONLY when one of our own windows is key, so it can never close another app's window.
+            listen("com.aakarsh.tegula.cmdw") {
+                guard NSApp.isActive, NSApp.keyWindow != nil else { Log.d("cmdw skipped: Tegula window not key"); return }
+                for down in [true, false] {
+                    let e = CGEvent(keyboardEventSource: CGEventSource(stateID: .hidSystemState), virtualKey: 13, keyDown: down)
+                    e?.flags = .maskCommand; e?.post(tap: .cghidEventTap)
+                }
+                Log.d("cmdw posted")
+            }
+            // Synthesises a real keystroke at the HID level so the full Carbon hotkey path is exercised.
+            for a in Action.allCases {
+                listen("com.aakarsh.tegula.key.\(a.rawValue)") {
+                    guard let sc = Settings.shared.shortcut(for: a.rawValue) else { Log.d("key \(a.rawValue): no shortcut"); return }
+                    var f: CGEventFlags = []
+                    if sc.mods & 4096 != 0 { f.insert(.maskControl) }
+                    if sc.mods & 2048 != 0 { f.insert(.maskAlternate) }
+                    if sc.mods & 512 != 0 { f.insert(.maskShift) }
+                    if sc.mods & 256 != 0 { f.insert(.maskCommand) }
+                    if (123...126).contains(sc.keyCode) { f.insert(.maskSecondaryFn); f.insert(.maskNumericPad) }   // real arrow keys carry these
+                    Log.d("synth key \(sc.display) for \(a.rawValue); frontmost=\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "-")")
+                    for down in [true, false] {
+                        let e = CGEvent(keyboardEventSource: CGEventSource(stateID: .hidSystemState), virtualKey: CGKeyCode(sc.keyCode), keyDown: down)
+                        e?.flags = f
+                        e?.post(tap: .cghidEventTap)
+                    }
+                }
+            }
+            for a in Action.allCases { listen("com.aakarsh.tegula.do.\(a.rawValue)") { [weak self] in Log.d("debug action \(a.rawValue)"); self?.perform(a.rawValue) } }
         }
 
         // Accessibility trust changes are announced by the OS, so no polling is needed.

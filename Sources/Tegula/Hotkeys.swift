@@ -41,8 +41,11 @@ final class Hotkeys {
             counter += 1
             var ref: EventHotKeyRef?
             let hid = EventHotKeyID(signature: OSType(0x54474C41), id: counter)   // 'TGLA'
-            if RegisterEventHotKey(sc.keyCode, sc.mods, hid, GetApplicationEventTarget(), 0, &ref) == noErr, let ref = ref {
+            let st = RegisterEventHotKey(sc.keyCode, sc.mods, hid, GetApplicationEventTarget(), 0, &ref)
+            if st == noErr, let ref = ref {
                 refs[action] = ref; idToAction[counter] = action
+            } else {
+                Log.d("hotkey REGISTER FAILED \(action) \(sc.display) status=\(st)")   // -9878 = already taken by another app
             }
         }
     }

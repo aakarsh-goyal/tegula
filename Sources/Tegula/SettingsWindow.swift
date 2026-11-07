@@ -88,19 +88,41 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         window?.makeKeyAndOrderFront(nil)
     }
 
-    func select(tab: Int) { (window?.contentView as? NSTabView)?.selectTabViewItem(at: tab) }
+    private var tabs: NSTabViewController?
+
+    func select(tab: Int) { tabs?.selectedTabViewItemIndex = max(0, min(tab, (tabs?.tabViewItems.count ?? 1) - 1)) }
 
     // MARK: building
 
+    /// Native Settings structure: a toolbar whose items are the tabs (AppKit's `.toolbar` tab style). This is
+    /// what gives the window the system chrome (large corners, Liquid Glass title bar and traffic lights).
     private func build() {
         guard let w = window else { return }
-        w.title = "Tegula"
-        let tabs = NSTabView()
-        for (title, view) in [(L10n.t(.general), general()), (L10n.t(.borders), appearance()), (L10n.t(.behavior), behavior()),
-                              (L10n.t(.shortcuts), shortcuts()), (L10n.t(.setupsHint), setupsPane()), (L10n.t(.about), about())] {
-            let item = NSTabViewItem(); item.label = title; item.view = view; tabs.addTabViewItem(item)
+        let keep = tabs?.selectedTabViewItemIndex ?? 0
+        let tvc = NSTabViewController()
+        tvc.tabStyle = .toolbar
+        let panes: [(String, String, NSView, CGFloat)] = [
+            (L10n.t(.general), "gearshape", general(), 430),
+            (L10n.t(.borders), "paintbrush", appearance(), 250),
+            (L10n.t(.behavior), "slider.horizontal.3", behavior(), 420),
+            (L10n.t(.shortcuts), "keyboard", shortcuts(), 520),
+            (L10n.t(.setupsHint), "rectangle.3.group", setupsPane(), 440),
+            (L10n.t(.about), "info.circle", about(), 300),
+        ]
+        for (title, symbol, view, height) in panes {
+            let vc = NSViewController()
+            view.frame = NSRect(x: 0, y: 0, width: 620, height: height)
+            vc.view = view
+            vc.preferredContentSize = NSSize(width: 620, height: height)
+            let item = NSTabViewItem(viewController: vc)
+            item.label = title
+            item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+            tvc.addTabViewItem(item)
         }
-        w.contentView = tabs
+        tabs = tvc
+        w.contentViewController = tvc
+        tvc.selectedTabViewItemIndex = keep
+        w.setContentSize(NSSize(width: 620, height: panes[min(keep, panes.count - 1)].3))
     }
 
     private func grid(_ rows: [[NSView]]) -> NSView {

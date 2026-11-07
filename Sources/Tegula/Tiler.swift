@@ -11,6 +11,8 @@ final class TWin {
     var expected = CGRect.zero
     var snapCount = 0
     var snapStamp = Date.distantPast
+    var anchorRight = false, anchorBottom = false     // tile touches the screen's right/bottom edge
+    var settledTarget: CGRect?, settledFrame: CGRect?  // where an increment-snapping window ended up for a target
     init(id: CGWindowID, el: AXUIElement, pid: pid_t, bundle: String, display: String) {
         self.id = id; self.el = el; self.pid = pid; self.bundle = bundle; self.display = display
     }
@@ -45,6 +47,7 @@ final class Tiler {
     private var userFloating = Set<CGWindowID>()
     private(set) var activeID: CGWindowID?                  // focused AND tiled
     private(set) var focusedRaw: CGWindowID?                // focused window, tiled or not
+    private var lastActive: [pid_t: CGWindowID] = [:]       // per app: last tiled window that was active
 
     private var started = false
     private var pendingPIDs = Set<pid_t>()
@@ -109,6 +112,7 @@ final class Tiler {
             guard let self = self, let tw = self.wins[id], let f = tw.el.frame else { return }
             let r = tw.expected
             if f.width > r.width + 2 || f.height > r.height + 2 { self.verify.append((id, r, tw.display)); self.scheduleVerify() }
+            self.settle(tw)
         }
         updateHoverMonitor()
         resyncAll(initial: true)
@@ -346,7 +350,11 @@ final class Tiler {
         for (i, ids) in work.enumerated() {
             var r = rects[i]
             if ids.count > 1 && strip > 0 { r.origin.y += strip; r.size.height -= strip }
-            for id in ids { apply(id, r, display: key, animated: animated) }
+            let right = rects[i].maxX >= avail.maxX - 0.5, bottom = rects[i].maxY >= avail.maxY - 0.5
+            for id in ids {
+                wins[id]?.anchorRight = right; wins[id]?.anchorBottom = bottom
+                apply(id, r, display: key, animated: animated)
+            }
         }
         Log.d("retile \(key) \(kind.rawValue) ultra=\(scr.ultrawide) tiles=\(work.map { $0.count }) floated=\(floated.count) rects=\(rects.map { "\(Int($0.minX)),\(Int($0.minY)) \(Int($0.width))x\(Int($0.height))" })")
         scheduleVerify()
@@ -369,6 +377,9 @@ final class Tiler {
         let running = anim.current(id)
         guard let cur = running ?? tw.el.frame else { return }
         if running == nil && near(cur, r) { return }
+        // A window that snaps to a size grid (Terminal's character cells) can't reach `r` exactly; once it
+        // has settled for this target, don't keep re-moving it.
+        if running == nil, let t = tw.settledTarget, t == r, let f = tw.settledFrame, near(cur, f) { return }
         tw.lastApplied = Date()
         if animated && Motion.enabled {
             anim.move(id, el: tw.el, pid: tw.pid, from: cur, to: r)
@@ -377,6 +388,25 @@ final class Tiler {
         anim.cancel(id)
         tw.el.setFrame(r)
         if let f = tw.el.frame, f.width > r.width + 2 || f.height > r.height + 2 { verify.append((id, r, display)) }
+        settle(tw)
+    }
+
+    /// If the window ended up a little smaller than its tile (size increments / rounding), push it flush
+    /// against the screen edge it shares, so the slack falls between tiles instead of at the screen edge.
+    private func settle(_ tw: TWin) {
+        let r = tw.expected
+        guard var f = tw.el.frame else { return }
+        let dw = r.width - f.width, dh = r.height - f.height
+        guard (dw > 0.5 || dh > 0.5), dw < 64, dh < 64 else { tw.settledTarget = nil; return }
+        let x = tw.anchorRight ? r.maxX - f.width : r.minX
+        let y = tw.anchorBottom ? r.maxY - f.height : r.minY
+        if abs(f.minX - x) > 0.5 || abs(f.minY - y) > 0.5 {
+            tw.lastApplied = Date()
+            tw.el.setPosition(CGPoint(x: x, y: y))
+            f = tw.el.frame ?? f
+        }
+        tw.settledTarget = r; tw.settledFrame = f
+        Log.d("settle win=\(tw.id) target=\(Int(r.width))x\(Int(r.height)) got=\(Int(f.width))x\(Int(f.height)) at \(Int(f.minX)),\(Int(f.minY)) right=\(tw.anchorRight) bottom=\(tw.anchorBottom)")
     }
 
     private func scheduleVerify() {
@@ -415,15 +445,24 @@ final class Tiler {
 
     func refreshActive(draw: Bool = true) {
         var raw: CGWindowID?
+        var candidate: CGWindowID?
         if let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() {
-            let ax = AXUIElementCreateApplication(app.processIdentifier)
+            let pid = app.processIdentifier
+            let ax = AXUIElementCreateApplication(pid)
             AXUIElementSetMessagingTimeout(ax, 0.2)
             raw = ax.element(kAXFocusedWindowAttribute)?.windowID
+            candidate = raw.flatMap { wins[$0] != nil ? $0 : nil }
+            // Focus can sit on a panel that isn't tiled (Picture-in-Picture, a popover, a sheet), or be
+            // missing for a moment. The app's own tiled window is still what shortcuts should act on.
+            if candidate == nil, let m = ax.element(kAXMainWindowAttribute)?.windowID, wins[m] != nil { candidate = m }
+            if candidate == nil, let l = lastActive[pid], wins[l] != nil { candidate = l }
+            if candidate == nil { candidate = wins.values.filter { $0.pid == pid }.map { $0.id }.min() }
+            if let c = candidate { lastActive[pid] = c }
         } else if NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid() {
             return
         }
         focusedRaw = raw
-        activeID = raw.flatMap { wins[$0] != nil ? $0 : nil }
+        activeID = candidate
         if let a = activeID {   // keep the focused window on top of its stack
             for key in tiles.keys {
                 guard var t = tiles[key], let i = t.firstIndex(where: { $0.contains(a) }) else { continue }
@@ -530,7 +569,11 @@ final class Tiler {
     }
 
     func swapInDirection(_ dx: Int, _ dy: Int) {
-        guard running, let id = activeID, let loc = locate(id), let rects = tileRects[loc.key], loc.tile < rects.count else { return }
+        guard running, let id = activeID, let loc = locate(id), let rects = tileRects[loc.key], loc.tile < rects.count else {
+            Log.d("swap(\(dx),\(dy)) ignored: running=\(running) active=\(String(describing: activeID)) located=\(activeID.flatMap { locate($0) } != nil)")
+            return
+        }
+        Log.d("swap(\(dx),\(dy)) win=\(id) tile=\(loc.tile) of \(rects.count) on \(loc.key.prefix(8))")
         let me = rects[loc.tile]
         let c = CGPoint(x: me.midX, y: me.midY)
         var best: (Int, CGFloat)?
@@ -722,7 +765,33 @@ final class Tiler {
             }
         }
     }
+
+    /// Debug-only (needs `debugLog`): writes what the tiler believes, per app, to the log.
+    func debugDump() {
+        Log.d("DUMP sdk=0x\(String(dyld_get_program_sdk_version(), radix: 16)) minos-check os=\(ProcessInfo.processInfo.operatingSystemVersionString) reduceMotion=\(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)")
+        Log.d("DUMP running=\(running) trusted=\(trusted) stage=\(stageManagerOn) paused=\(Settings.shared.paused) active=\(String(describing: activeID)) focusedRaw=\(String(describing: focusedRaw)) userFloating=\(userFloating.count)")
+        for (k, t) in tiles { Log.d("DUMP tiles[\(k.prefix(8))]=\(t) rects=\(tileRects[k]?.count ?? 0)") }
+        let front = NSWorkspace.shared.frontmostApplication
+        Log.d("DUMP frontmost=\(front?.bundleIdentifier ?? "-")")
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular && app.processIdentifier != getpid() {
+            let pid = app.processIdentifier, b = app.bundleIdentifier ?? "?"
+            let ax = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(ax, 0.3)
+            var raw: CFTypeRef?
+            let err = AXUIElementCopyAttributeValue(ax, kAXWindowsAttribute as CFString, &raw)
+            let list = (raw as? [AXUIElement]) ?? []
+            var fw: CFTypeRef?
+            let ferr = AXUIElementCopyAttributeValue(ax, kAXFocusedWindowAttribute as CFString, &fw)
+            Log.d("DUMP app \(b) pid=\(pid) hidden=\(app.isHidden) observer=\(observers[pid] != nil) windowsErr=\(err.rawValue) n=\(list.count) focusedErr=\(ferr.rawValue) front=\(app == front)")
+            for w in list {
+                let id = w.windowID
+                Log.d("DUMP   win=\(String(describing: id)) role=\(w.string(kAXRoleAttribute) ?? "-") sub=\(w.string(kAXSubroleAttribute) ?? "-") min=\(String(describing: w.bool(kAXMinimizedAttribute))) fs=\(String(describing: w.bool("AXFullScreen"))) posSet=\(w.isSettable(kAXPositionAttribute)) sizeSet=\(w.isSettable(kAXSizeAttribute)) tracked=\(id.map { wins[$0] != nil } ?? false) floatedByUs=\(id.map { userFloating.contains($0) } ?? false) eligible=\(id.map { eligible(w, id: $0, bundle: b, hidden: app.isHidden) } ?? false) frame=\(w.frame.map { "\(Int($0.minX)),\(Int($0.minY)) \(Int($0.width))x\(Int($0.height))" } ?? "-") expected=\(id.flatMap { wins[$0] }.map { "\(Int($0.expected.minX)),\(Int($0.expected.minY)) \(Int($0.expected.width))x\(Int($0.expected.height))" } ?? "-")")
+            }
+        }
+    }
 }
+
+@_silgen_name("dyld_get_program_sdk_version") func dyld_get_program_sdk_version() -> UInt32
 
 extension Array { subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil } }
 

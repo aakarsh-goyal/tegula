@@ -6,6 +6,11 @@ swift build -c release
 APP=build/Tegula.app
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp .build/release/Tegula "$APP/Contents/MacOS/Tegula"
+# SwiftPM stamps the Mach-O with sdk == deployment target (15.0), so macOS treats the app as built for
+# macOS 15 and keeps the legacy window chrome. We do compile against the current SDK; say so, keeping
+# minos 15.0 so it still runs on Sequoia. (This is what makes traffic lights etc. adopt Liquid Glass.)
+vtool -set-build-version macos 15.0 "$(xcrun --show-sdk-version)" -replace \
+  -output "$APP/Contents/MacOS/Tegula" "$APP/Contents/MacOS/Tegula"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 if [ ! -f Resources/Slate.icns ] || [ Scripts/make-icons.swift -nt Resources/Slate.icns ]; then
   swift Scripts/make-icons.swift Resources
