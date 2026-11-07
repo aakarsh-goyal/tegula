@@ -68,6 +68,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 debugHandlers[name] = f
                 CFNotificationCenterAddObserver(center, nil, darwinCallback, name as CFString, nil, .deliverImmediately)
             }
+            listen("com.aakarsh.tegula.panelquit") {
+                guard Hotkeys.shared.hasTemporary else { Log.d("panelquit skipped: panel not open"); return }
+                Log.d("posting Cmd-Q while panel open")
+                for down in [true, false] {
+                    let e = CGEvent(keyboardEventSource: CGEventSource(stateID: .hidSystemState), virtualKey: 12, keyDown: down)
+                    e?.flags = .maskCommand; e?.post(tap: .cghidEventTap)
+                }
+            }
             listen("com.aakarsh.tegula.dump") { Tiler.shared.debugDump() }
             // Posts ⌘W, but ONLY when one of our own windows is key, so it can never close another app's window.
             listen("com.aakarsh.tegula.cmdw") {
@@ -105,6 +113,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { Tiler.shared.start() }
         }
         if Tiler.shared.trusted { Tiler.shared.start() } else { requestAccess() }
+        if CommandLine.arguments.contains("--test-panel-quit") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                self?.menu.debugOpen()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    guard Hotkeys.shared.hasTemporary else { Log.d("test-panel-quit: panel not open, not posting"); return }
+                    Log.d("test-panel-quit: posting Cmd-Q")
+                    for down in [true, false] {
+                        let e = CGEvent(keyboardEventSource: CGEventSource(stateID: .hidSystemState), virtualKey: 12, keyDown: down)
+                        e?.flags = .maskCommand; e?.post(tap: .cghidEventTap)
+                    }
+                }
+            }
+        }
         if CommandLine.arguments.contains("--open-menu") { DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.menu.debugOpen() } }
         if CommandLine.arguments.contains("--cycle-layout") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
@@ -135,6 +156,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func perform(_ id: String) {
         let t = Tiler.shared
+        if id == "panel.quit" { NSApp.terminate(nil); return }
+        if id == "panel.settings" { menu.dismiss(); SettingsWindowController.shared.show(); return }
         if id.hasPrefix("setup.") {
             if let s = Settings.shared.setups.first(where: { "setup." + $0.id == id }) { t.launchSetup(s) }
             return

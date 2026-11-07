@@ -29,9 +29,33 @@ final class Hotkeys {
         if let a = idToAction[id] { DispatchQueue.main.async { self.onAction?(a) } }
     }
 
+    // Shortcuts that exist only while the menu-bar panel is open. The panel never activates Tegula, so
+    // without these, keys like ⌘Q would go to whichever app is in front.
+    private var tempRefs: [EventHotKeyRef] = []
+    var hasTemporary: Bool { !tempRefs.isEmpty }
+
+    func pushTemporary(_ shortcuts: [String: Shortcut]) {
+        installHandler()
+        popTemporary()
+        for (action, sc) in shortcuts {
+            counter += 1
+            var ref: EventHotKeyRef?
+            let hid = EventHotKeyID(signature: OSType(0x54474C41), id: counter)
+            if RegisterEventHotKey(sc.keyCode, sc.mods, hid, GetApplicationEventTarget(), 0, &ref) == noErr, let ref = ref {
+                tempRefs.append(ref); idToAction[counter] = action
+            }
+        }
+    }
+
+    func popTemporary() {
+        for r in tempRefs { UnregisterEventHotKey(r) }
+        tempRefs.removeAll()
+        idToAction = idToAction.filter { !$0.value.hasPrefix("panel.") }
+    }
+
     func unregisterAll() {
         for (_, r) in refs { UnregisterEventHotKey(r) }
-        refs.removeAll(); idToAction.removeAll()
+        refs.removeAll(); idToAction = idToAction.filter { $0.value.hasPrefix("panel.") }
     }
 
     func reload() {

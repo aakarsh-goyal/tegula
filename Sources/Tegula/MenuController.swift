@@ -1,4 +1,5 @@
 import AppKit
+import Carbon
 
 // MARK: - panel building blocks (hover is handled by tracking areas, so the highlight is instant)
 
@@ -120,6 +121,10 @@ final class MenuController: NSObject {
         NSAnimationContext.runAnimationGroup { ctx in ctx.duration = 0.12; p.animator().alphaValue = 1 }
         // Dismiss when the user clicks anywhere else (installed only while the panel is open).
         clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in self?.close() }
+        Hotkeys.shared.pushTemporary([
+            "panel.quit": Shortcut(keyCode: 12, mods: UInt32(cmdKey), label: "Q"),
+            "panel.settings": Shortcut(keyCode: 43, mods: UInt32(cmdKey), label: ","),
+        ])
         activateObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
                 let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
@@ -127,8 +132,11 @@ final class MenuController: NSObject {
             }
     }
 
+    func dismiss() { close() }
+
     private func close() {
         Log.d("panel close")
+        Hotkeys.shared.popTemporary()
         if let m = clickMonitor { NSEvent.removeMonitor(m); clickMonitor = nil }
         if let o = activateObserver { NSWorkspace.shared.notificationCenter.removeObserver(o); activateObserver = nil }
         panel?.orderOut(nil)
