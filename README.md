@@ -18,7 +18,16 @@ it is fully event-driven — no timers, no polling, nothing running while your w
 - Every shortcut is rebindable, with conflict detection against macOS and other apps.
 - English, Spanish, Japanese, Korean, Simplified Chinese; light / dark / system theme; two app icons (Slate, Clay).
 
-## Build
+## Install
+
+```sh
+brew install --cask aakarsh-goyal/tegula/tegula
+```
+
+Apple silicon, macOS 15+. The app is ad-hoc signed (not notarized); the cask clears the download quarantine
+flag so it opens normally. Grant Accessibility on first launch.
+
+## Build from source
 
 ```sh
 Scripts/build.sh            # → build/Tegula.app
