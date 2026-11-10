@@ -47,6 +47,7 @@ final class Tiler {
     private var userFloating = Set<CGWindowID>()
     private(set) var activeID: CGWindowID?                  // focused AND tiled
     private(set) var focusedRaw: CGWindowID?                // focused window, tiled or not
+    private var mru: [CGWindowID] = []                       // window ids, most recently active first
     private var lastActive: [pid_t: CGWindowID] = [:]       // per app: last tiled window that was active
 
     private var started = false
@@ -179,7 +180,7 @@ final class Tiler {
         let pids = Set(NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }.map { $0.processIdentifier })
         for p in pids { syncApp(p) }
         for w in wins.values where !pids.contains(w.pid) { remove(w.id) }
-        if initial { reorder(by: order) }
+        if initial { reorder(by: order); mru = order.filter { wins[$0] != nil } }
         if reset { for key in tiles.keys { tiles[key] = tiles[key]?.filter { !$0.isEmpty } } }
         refreshActive(draw: false)
         flushAll(animated: reset)
@@ -275,6 +276,7 @@ final class Tiler {
             tiles[key] = tiles[key]?.map { $0.filter { $0 != id } }.filter { !$0.isEmpty }
         }
         minSizes[id] = nil
+        mru.removeAll { $0 == id }
         dirty.insert(tw.display)
     }
 
@@ -300,6 +302,8 @@ final class Tiler {
         retileWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: w)
     }
+
+    private func rank(_ id: CGWindowID) -> Int { mru.firstIndex(of: id) ?? mru.count + 1000 }
 
     private func tileMin(_ ids: [CGWindowID]) -> CGSize {
         var s = CGSize.zero
@@ -334,7 +338,18 @@ final class Tiler {
             let needH = LayoutEngine.minExtent(tree, .vertical, gap: gap, mins: mins)
             if work.count == 1 && work[0].count == 1 { break }
             if needW <= Double(avail.width) + 0.5 && needH <= Double(avail.height) + 0.5 { break }
-            // Won't fit: float the single hungriest window of the hungriest tile (never a whole stack).
+            // Won't fit. Rather than float a window over its neighbours, stack the least recently used tile
+            // behind another one: the windows you used last keep their own, fully visible tiles.
+            if work.count > 1 {
+                func tileRank(_ t: [CGWindowID]) -> Int { t.map(rank).min() ?? Int.max }
+                let order = work.indices.sorted { tileRank(work[$0]) > tileRank(work[$1]) }   // oldest first
+                let victim = order[0], host = order[1]
+                Log.d("retile stacks stale tile \(work[victim]) behind \(work[host])")
+                work[host] = (work[host] + work[victim]).sorted { rank($0) > rank($1) }      // most recent on top (last)
+                work.remove(at: victim)
+                continue
+            }
+            // A single tile that still won't fit: float the hungriest window (never a whole stack).
             func area(_ id: CGWindowID) -> CGFloat { (minSizes[id]?.width ?? 0) * (minSizes[id]?.height ?? 0) }
             let worst = mins.indices.max { mins[$0].width * mins[$0].height < mins[$1].width * mins[$1].height }!
             guard let victim = work[worst].max(by: { area($0) < area($1) }) else { break }
@@ -437,7 +452,8 @@ final class Tiler {
                     guard let tw = wins[it.id], let f = tw.el.frame, let f0 = first[it.id] else { continue }
                     // Stale item (a newer target exists or a glide is running) or a size that is still moving.
                     guard tw.expected == it.want, WindowAnimator.shared.target(it.id) == nil, near(f, f0) else { continue }
-                    let wOver = f.width > it.want.width + 2, hOver = f.height > it.want.height + 2
+                    // A few points of overshoot is size-grid rounding (Terminal's character cells), not a minimum.
+                    let wOver = f.width > it.want.width + 12, hOver = f.height > it.want.height + 20
                     guard wOver || hOver else { continue }
                     let old = minSizes[it.id] ?? .zero
                     let new = CGSize(width: wOver ? max(old.width, f.width) : old.width, height: hOver ? max(old.height, f.height) : old.height)
@@ -484,6 +500,7 @@ final class Tiler {
         }
         focusedRaw = raw
         activeID = candidate
+        if let a = candidate, mru.first != a { mru.removeAll { $0 == a }; mru.insert(a, at: 0) }
         if let a = activeID {   // keep the focused window on top of its stack
             for key in tiles.keys {
                 guard var t = tiles[key], let i = t.firstIndex(where: { $0.contains(a) }) else { continue }
