@@ -311,6 +311,13 @@ final class Tiler {
         guard running, let scr = ScreenInfo.all().first(where: { $0.key == key }) else { return }
         let set = Settings.shared
         var work = (tiles[key] ?? []).map { $0.filter { wins[$0] != nil } }.filter { !$0.isEmpty }
+        // Self-heal: a window we track on this display that sits in no tile (and isn't deliberately floated)
+        // would never be tiled again. Adopt it.
+        let tiled = Set(tiles.values.flatMap { $0.flatMap { $0 } })
+        for tw in wins.values.sorted(by: { $0.id < $1.id }) where tw.display == key && !tiled.contains(tw.id) && !userFloating.contains(tw.id) {
+            Log.d("retile adopts orphan win=\(tw.id) bundle=\(tw.bundle)")
+            work.append([tw.id])
+        }
         rebalance(&work, cap: scr.capacity)
         guard !work.isEmpty else { tiles[key] = []; tileRects[key] = []; return }
 
@@ -340,11 +347,11 @@ final class Tiler {
         tileRects[key] = rects
         // Windows that cannot fit any tile float, centred.
         for id in floated {
+            userFloating.insert(id)   // stays out of the layout until "Retile All" (even if the frame read below fails)
             guard let tw = wins[id], let f = tw.el.frame else { continue }
             let size = CGSize(width: min(f.width, avail.width), height: min(f.height, avail.height))
             tw.lastApplied = Date()
             tw.el.setPosition(CGPoint(x: avail.midX - size.width / 2, y: avail.midY - size.height / 2))
-            userFloating.insert(id)   // stays out of the layout until "Retile All"
         }
         let strip = set.tabView ? TabStripLayout.height : 0
         for (i, ids) in work.enumerated() {
@@ -376,6 +383,11 @@ final class Tiler {
         if let t = anim.target(id), near(t, r) { return }                 // already gliding there
         let running = anim.current(id)
         guard let cur = running ?? tw.el.frame else { return }
+        if running == nil, var m = minSizes[id] {   // a learned minimum the window has since undercut was wrong
+            if cur.width < m.width - 2 { m.width = cur.width }
+            if cur.height < m.height - 2 { m.height = cur.height }
+            minSizes[id] = (m.width <= 0 && m.height <= 0) ? nil : m
+        }
         if running == nil && near(cur, r) { return }
         // A window that snaps to a size grid (Terminal's character cells) can't reach `r` exactly; once it
         // has settled for this target, don't keep re-moving it.
@@ -414,17 +426,26 @@ final class Tiler {
         let w = DispatchWorkItem { [self] in
             verifyWork = nil
             let items = verify; verify.removeAll()
-            var changed = Set<String>()
-            for it in items {
-                guard let tw = wins[it.id], let f = tw.el.frame else { continue }
-                let wOver = f.width > it.want.width + 2, hOver = f.height > it.want.height + 2
-                guard wOver || hOver else { continue }
-                let old = minSizes[it.id] ?? .zero
-                let new = CGSize(width: wOver ? max(old.width, f.width) : old.width, height: hOver ? max(old.height, f.height) : old.height)
-                if new != old { minSizes[it.id] = new; changed.insert(it.display) }
+            // First read now, second read shortly after: a size is only a real minimum if it holds still.
+            // Apps that resize asynchronously (WhatsApp/Catalyst, Electron) otherwise report a stale,
+            // larger frame that gets mistaken for a minimum and floats the window for good.
+            var first: [CGWindowID: CGRect] = [:]
+            for it in items { if let f = wins[it.id]?.el.frame { first[it.id] = f } }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [self] in
+                var changed = Set<String>()
+                for it in items {
+                    guard let tw = wins[it.id], let f = tw.el.frame, let f0 = first[it.id] else { continue }
+                    // Stale item (a newer target exists or a glide is running) or a size that is still moving.
+                    guard tw.expected == it.want, WindowAnimator.shared.target(it.id) == nil, near(f, f0) else { continue }
+                    let wOver = f.width > it.want.width + 2, hOver = f.height > it.want.height + 2
+                    guard wOver || hOver else { continue }
+                    let old = minSizes[it.id] ?? .zero
+                    let new = CGSize(width: wOver ? max(old.width, f.width) : old.width, height: hOver ? max(old.height, f.height) : old.height)
+                    if new != old { minSizes[it.id] = new; changed.insert(it.display) }
+                }
+                for k in changed { dirty.insert(k) }
+                if !changed.isEmpty { flush() }
             }
-            for k in changed { dirty.insert(k) }
-            if !changed.isEmpty { flush() }
         }
         verifyWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: w)
@@ -770,7 +791,14 @@ final class Tiler {
     func debugDump() {
         Log.d("DUMP sdk=0x\(String(dyld_get_program_sdk_version(), radix: 16)) minos-check os=\(ProcessInfo.processInfo.operatingSystemVersionString) reduceMotion=\(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)")
         Log.d("DUMP running=\(running) trusted=\(trusted) stage=\(stageManagerOn) paused=\(Settings.shared.paused) active=\(String(describing: activeID)) focusedRaw=\(String(describing: focusedRaw)) userFloating=\(userFloating.count)")
-        for (k, t) in tiles { Log.d("DUMP tiles[\(k.prefix(8))]=\(t) rects=\(tileRects[k]?.count ?? 0)") }
+        for scr in ScreenInfo.all() {
+            Log.d("DUMP display \(scr.key.prefix(8)) full=\(scr.full) usable=\(scr.usable) capacity=\(scr.capacity) layout=\(Settings.shared.layout(for: scr.key).rawValue)")
+        }
+        for (k, t) in tiles {
+            Log.d("DUMP tiles[\(k.prefix(8))]=\(t) rects=\(tileRects[k]?.count ?? 0) rectList=\((tileRects[k] ?? []).map { "\(Int($0.minX)),\(Int($0.minY)) \(Int($0.width))x\(Int($0.height))" })")
+        }
+        for (id, m) in minSizes { Log.d("DUMP learnedMin win=\(id) bundle=\(wins[id]?.bundle ?? "-") display=\(wins[id]?.display.prefix(8) ?? "-") min=\(Int(m.width))x\(Int(m.height))") }
+        for id in userFloating { Log.d("DUMP floated win=\(id) bundle=\(wins[id]?.bundle ?? "-") frame=\(String(describing: wins[id]?.el.frame))") }
         let front = NSWorkspace.shared.frontmostApplication
         Log.d("DUMP frontmost=\(front?.bundleIdentifier ?? "-")")
         for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular && app.processIdentifier != getpid() {
