@@ -591,10 +591,6 @@ final class Tiler {
         else if Overlays.shared.dimsSuppressed && dimResumeWork == nil { scheduleDimResume(after: 1.5) }   // fallback
         activeID = candidate
         if let a = candidate, mru.first != a { mru.removeAll { $0 == a }; mru.insert(a, at: 0) }
-        // Focusing any other window on a display ends its maximized state.
-        if let a = candidate, let d = wins[a]?.display, let m = maximized[d], m != a {
-            maximized[d] = nil; dirty.insert(d); scheduleRetileAll()
-        }
         if let a = activeID {   // keep the focused window on top of its stack
             for key in tiles.keys {
                 guard var t = tiles[key], let i = t.firstIndex(where: { $0.contains(a) }) else { continue }
@@ -756,7 +752,7 @@ final class Tiler {
     }
 
     /// ⌃⌥↩: fills the screen with the active window, whether or not tiling is running. While tiling runs, the
-    /// other windows keep their places in the active layout behind it; press again (or focus another window) to restore.
+    /// other windows keep their places in the active layout behind it; it stays maximized, even when other windows take focus, until you press ⌃⌥↩ again or ⌃⌥←/→.
     func toggleMaximize() {
         guard let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() else { return }
         let ax = AXUIElementCreateApplication(app.processIdentifier)

@@ -12,7 +12,7 @@ it is fully event-driven — no timers, no polling, nothing running while your w
 - **Glides, not jumps** — windows animate to their tiles (every frame applied, off the main thread).
 - **Swap** windows with ⌘-drag, or ⌃⌥ + arrow; push past the screen edge to send a window to the next display.
 - **Small monitor mode** (Settings, off by default): Columns and Rows hold two windows. A third window takes the tile of the least recently used one, which stacks behind it. In Rows, ⌃⌥← / ⌃⌥→ swap the two windows (up/down).
-- **Maximize** the active window with ⌃⌥↩ (works even when tiling is paused); the other windows stay arranged in the active layout behind it. Press again, or ⌃⌥← / ⌃⌥→, to return to the layout.
+- **Maximize** the active window with ⌃⌥↩ (works even when tiling is paused); the other windows stay arranged in the active layout behind it. It stays maximized, even when other windows take focus, until you press ⌃⌥↩ again or ⌃⌥← / ⌃⌥→ to return to the layout.
 - **Focus** — *Dim Others* (darken everything but the active window) or *No Peek* (blur and darken), both faded in softly. Switching windows crossfades; the dim steps aside for Mission Control, App Exposé, Show Desktop and native full screen, and returns gently afterwards.
 - **Clean Space** hides apps that have no tiled window; **Setups (beta)** saves and restores app arrangements across displays.
 - **Pause** with ⌃⌥T, exclude individual apps, floating for windows that can't shrink to fit (minimum sizes are learned).
