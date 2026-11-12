@@ -47,6 +47,8 @@ final class Tiler {
     private var userFloating = Set<CGWindowID>()
     private(set) var activeID: CGWindowID?                  // focused AND tiled
     private(set) var focusedRaw: CGWindowID?                // focused window, tiled or not
+    private var focusedFullScreen = false                    // that window is in native full screen (its own Space)
+    private var fullScreenIDs = Set<CGWindowID>()          // tiled windows currently in native full screen: they keep their tile
     private var maximized: [String: CGWindowID] = [:]      // per display: the tiled window currently filling the screen
     private var freeMax: [CGWindowID: CGRect] = [:]         // restore frames for maximized windows we don't tile
     private var mru: [CGWindowID] = []                       // window ids, most recently active first
@@ -96,6 +98,16 @@ final class Tiler {
         on(NSWorkspace.didUnhideApplicationNotification) { [self] n in pidOf(n).map { scheduleSync($0) } }
         on(NSWorkspace.didActivateApplicationNotification) { [self] _ in refreshActive() }
         on(NSWorkspace.activeSpaceDidChangeNotification) { [self] _ in
+            // macOS reshuffles window order while a Space transition settles: keep the dimmer under the focused
+            // window for that short stretch (one-shot burst, ~0.6s, not a standing timer).
+            func burst(_ n: Int) {
+                Overlays.shared.reassertDimOrder(below: focusedRaw)
+                if n > 0 { DispatchQueue.main.asyncAfter(deadline: .now() + 0.008) { burst(n - 1) } }
+            }
+            refreshActive(draw: false)   // learn right now whether we are in / left full screen
+            // The slide is over: bring the dimmer back once the window has settled into its tile (gently).
+            if !focusedFullScreen && Overlays.shared.dimsSuppressed { scheduleDimResume(after: 0.15) }
+            burst(75)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.resyncAll() }
         }
         on(NSWorkspace.didWakeNotification) { [self] _ in
@@ -110,6 +122,7 @@ final class Tiler {
                 NotificationCenter.default.post(name: Settings.changed, object: nil)
             }
         }
+        Overlays.shared.frameProvider = { [weak self] id in self?.wins[id].flatMap { $0.expected == .zero ? nil : $0.expected } }   // no AX call on the hot path
         WindowAnimator.shared.touch = { [weak self] id in self?.wins[id]?.lastApplied = Date() }
         WindowAnimator.shared.onFinish = { [weak self] id in
             guard let self = self, let tw = self.wins[id], let f = tw.el.frame else { return }
@@ -117,7 +130,7 @@ final class Tiler {
             if f.width > r.width + 2 || f.height > r.height + 2 { self.verify.append((id, r, tw.display)); self.scheduleVerify() }
             self.settle(tw)
         }
-        updateHoverMonitor()
+        updateHoverMonitor(); updateClickMonitor()
         resyncAll(initial: true)
     }
 
@@ -147,10 +160,13 @@ final class Tiler {
 
     fileprivate func axEvent(_ el: AXUIElement, _ note: String) {
         guard started, !Settings.shared.paused else { return }
+        Log.d("ax \(note) pid=\(el.pid)")
         switch note {
         case kAXFocusedWindowChangedNotification: refreshActive()
         case kAXWindowMovedNotification, kAXWindowResizedNotification: geometryChanged(el)
-        default: scheduleSync(el.pid)
+        default:
+            Overlays.shared.reassertDimOrder(below: focusedRaw)
+            scheduleSync(el.pid)
         }
     }
 
@@ -237,7 +253,10 @@ final class Tiler {
             if wins[id] != nil {
                 // Already tiled: only a positive signal removes it (don't re-probe attributes that can time out).
                 if app.isHidden || userFloating.contains(id) || Settings.shared.excluded.contains(bundle)
-                    || w.bool(kAXMinimizedAttribute) == true || w.bool("AXFullScreen") == true { continue }
+                    || w.bool(kAXMinimizedAttribute) == true { continue }
+                // Native full screen is temporary: keep the window's slot in the layout so it returns to it.
+                if w.bool("AXFullScreen") == true { fullScreenIDs.insert(id) }
+                else if fullScreenIDs.remove(id) != nil { dirty.insert(wins[id]?.display ?? "") }
                 present.insert(id); continue
             }
             guard eligible(w, id: id, bundle: bundle, hidden: app.isHidden) else { continue }
@@ -251,14 +270,31 @@ final class Tiler {
                 place(tw)
             }
         }
-        for w in wins.values where w.pid == pid && !present.contains(w.id) { remove(w.id) }
+        // AX only lists the windows of the Space you are looking at. A tracked window that is merely on another
+        // Space (e.g. while an app is in native full screen) is still alive: keep its slot in the layout.
+        let missing = wins.values.filter { $0.pid == pid && !present.contains($0.id) }
+        let alive = missing.contains { w in !list.contains { $0.windowID == w.id } } ? allWindowIDs() : []
+        for w in missing {
+            if !list.contains(where: { $0.windowID == w.id }) && alive.contains(w.id) { present.insert(w.id); continue }
+            remove(w.id)
+        }
         for (id, p) in observed where p == pid && !list.contains(where: { $0.windowID == id }) { observed[id] = nil; minSizes[id] = nil }
         if pendingSetup != nil { applyPendingSetup() }
     }
 
-    /// Columns and Rows hold at most two windows side by side; anything beyond that stacks behind a tile.
+    /// Every existing window on every Space (a closed window drops out of this list).
+    private func allWindowIDs() -> Set<CGWindowID> {
+        let info = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        return Set(info.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value })
+    }
+
+    /// Small monitor mode only: Columns and Rows hold at most two windows; anything beyond that stacks behind a tile.
+    private func twoWindowLimit(_ key: String) -> Bool {
+        Settings.shared.smallMonitor && [.columns, .rows].contains(Settings.shared.layout(for: key))
+    }
+
     private func capacity(_ key: String) -> Int {
-        if [.columns, .rows].contains(Settings.shared.layout(for: key)) { return 2 }
+        if twoWindowLimit(key) { return 2 }
         return ScreenInfo.all().first { $0.key == key }?.capacity ?? 4
     }
 
@@ -269,7 +305,7 @@ final class Tiler {
         var t = tiles[tw.display] ?? []
         if t.count < capacity(tw.display) {
             t.append([tw.id])
-        } else if [.columns, .rows].contains(Settings.shared.layout(for: tw.display)) {
+        } else if twoWindowLimit(tw.display) {
             // Two-window layouts: the new window takes the tile of the least recently used window,
             // which stacks behind it. The most recently used window keeps its place.
             let idx = t.indices.max { tileRank(t[$0]) < tileRank(t[$1]) } ?? t.count - 1
@@ -289,6 +325,7 @@ final class Tiler {
         }
         minSizes[id] = nil
         mru.removeAll { $0 == id }
+        fullScreenIDs.remove(id)
         for k in maximized.keys where maximized[k] == id { maximized[k] = nil }
         dirty.insert(tw.display)
     }
@@ -396,6 +433,7 @@ final class Tiler {
             if ids.count > 1 && strip > 0 { r.origin.y += strip; r.size.height -= strip }
             let right = rects[i].maxX >= avail.maxX - 0.5, bottom = rects[i].maxY >= avail.maxY - 0.5
             for id in ids {
+                if fullScreenIDs.contains(id) { continue }
                 if id == maximized[key] {   // fills the screen; the rest stay arranged in the layout behind it
                     wins[id]?.anchorRight = true; wins[id]?.anchorBottom = true
                     apply(id, avail, display: key, animated: animated)
@@ -504,21 +542,41 @@ final class Tiler {
                 continue
             }
             let rects = tileRects[key] ?? []
-            for (i, ids) in list.enumerated() where i < rects.count {
+            for (i, all) in list.enumerated() where i < rects.count {
+                let ids = all.filter { !fullScreenIDs.contains($0) }   // no borders/tabs over a full-screen Space
+                if ids.isEmpty { continue }
                 infos.append(TileInfo(key: key, index: i, rect: rects[i], ids: ids))
             }
         }
         Overlays.shared.refresh(tiles: infos, active: activeID, focused: focusedRaw, animated: animated)
     }
 
+    private var dimResumeWork: DispatchWorkItem?
+    private func scheduleDimResume(after d: TimeInterval) {
+        dimResumeWork?.cancel()
+        let w = DispatchWorkItem { [self] in
+            refreshActive(draw: false)
+            dimResumeWork = nil
+            guard !focusedFullScreen, Overlays.shared.dimsSuppressed else { return }
+            Overlays.shared.suppressDims(false)
+            publish()
+        }
+        dimResumeWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + d, execute: w)
+    }
+
     func refreshActive(draw: Bool = true) {
+        Log.d("refreshActive draw=\(draw)")
         var raw: CGWindowID?
         var candidate: CGWindowID?
+        var fullScreen = false
         if let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() {
             let pid = app.processIdentifier
             let ax = AXUIElementCreateApplication(pid)
             AXUIElementSetMessagingTimeout(ax, 0.2)
-            raw = ax.element(kAXFocusedWindowAttribute)?.windowID
+            let fw = ax.element(kAXFocusedWindowAttribute)
+            raw = fw?.windowID
+            fullScreen = (fw ?? ax.element(kAXMainWindowAttribute))?.bool("AXFullScreen") == true
             candidate = raw.flatMap { wins[$0] != nil ? $0 : nil }
             // Focus can sit on a panel that isn't tiled (Picture-in-Picture, a popover, a sheet), or be
             // missing for a moment. The app's own tiled window is still what shortcuts should act on.
@@ -530,6 +588,9 @@ final class Tiler {
             return
         }
         focusedRaw = raw
+        focusedFullScreen = fullScreen
+        if fullScreen { dimResumeWork?.cancel(); dimResumeWork = nil; Overlays.shared.suppressDims(true) }
+        else if Overlays.shared.dimsSuppressed && dimResumeWork == nil { scheduleDimResume(after: 1.5) }   // fallback
         activeID = candidate
         if let a = candidate, mru.first != a { mru.removeAll { $0 == a }; mru.insert(a, at: 0) }
         // Focusing any other window on a display ends its maximized state.
@@ -549,6 +610,12 @@ final class Tiler {
 
     private func geometryChanged(_ el: AXUIElement) {
         guard running, let id = el.windowID, let tw = wins[id] else { return }
+        if el.bool("AXFullScreen") == true { fullScreenIDs.insert(id); return }   // the OS owns its frame
+        if fullScreenIDs.remove(id) != nil {
+            dirty.insert(tw.display); scheduleRetileAll()
+            refreshActive()   // right now: brings the dimmer back instantly (no 30ms retile debounce)
+            return
+        }
         if Date().timeIntervalSince(tw.lastApplied) < 0.35 { return }
         if NSEvent.pressedMouseButtons & 1 != 0 {
             dragID = id
@@ -650,6 +717,9 @@ final class Tiler {
             return
         }
         Log.d("swap(\(dx),\(dy)) win=\(id) tile=\(loc.tile) of \(rects.count) on \(loc.key.prefix(8))")
+        // A maximized window: the arrow returns it to the layout, moving toward that side if there's a tile there.
+        let wasMaximized = maximized[loc.key] == id
+        if wasMaximized { maximized[loc.key] = nil; dirty.insert(loc.key) }
         let me = rects[loc.tile]
         let c = CGPoint(x: me.midX, y: me.midY)
         var best: (Int, CGFloat)?
@@ -663,6 +733,8 @@ final class Tiler {
         }
         if let (i, _) = best, let other = tiles[loc.key]?[i].last {
             swap(id, other)
+        } else if wasMaximized {
+            // already on that side: restoring is all that was asked
         } else {
             // past the screen edge: hop to the neighbouring display
             let screens = ScreenInfo.all()
@@ -745,7 +817,7 @@ final class Tiler {
 
     private func settingsChanged() {
         guard started else { return }
-        updateHoverMonitor()
+        updateHoverMonitor(); updateClickMonitor()
         if running { scheduleRetileAll() } else { Overlays.shared.hideAll() }
     }
 
@@ -758,6 +830,23 @@ final class Tiler {
             tiles[k] = nil; tileRects[k] = nil
         }
         scheduleRetileAll()
+    }
+
+    // MARK: focus-dim click pre-cover (installed only while Dim Others / No Peek is on)
+
+    private var clickMonitor: Any?
+    private func updateClickMonitor() {
+        let want = Settings.shared.focusMode != .off && running
+        if want, clickMonitor == nil {
+            clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in self?.clickDown() }
+        } else if !want, let m = clickMonitor {
+            NSEvent.removeMonitor(m); clickMonitor = nil
+        }
+    }
+
+    private func clickDown() {
+        guard let (k, i) = tileAt(Geo.axMouse()), let top = tiles[k]?[safe: i]?.last, top != focusedRaw else { return }
+        Overlays.shared.precover(new: top, old: focusedRaw)
     }
 
     // MARK: hover-to-activate (installed only while the option is on)
@@ -908,7 +997,7 @@ enum Log {
     static func d(_ s: @autoclosure () -> String) {
         guard on else { return }
         let path = NSHomeDirectory() + "/Library/Logs/Tegula.log"
-        let line = "\(Date()) \(s())\n"
+        let line = "\(String(format: "%.3f", Date().timeIntervalSince1970)) \(s())\n"
         if let h = FileHandle(forWritingAtPath: path) { h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); try? h.close() }
         else { try? line.write(toFile: path, atomically: true, encoding: .utf8) }
     }

@@ -7,7 +7,7 @@ enum S: String {
     case general, borders, behavior, shortcuts, about, mainSize, half, sixty, twoThirds, spacing, edgeSpace
     case top, bottom, left, right, theme, themeSystem, themeLight, themeDark, language, languageSystem
     case appIcon, launchAtLogin, borderStyle, borderNone, borderActive, borderAll, borderGlow, borderColor
-    case tabView, hoverActivate, quickActions, excludedApps, noExcluded, remove, addApp, notSet, pressKeys
+    case tabView, hoverActivate, quickActions, smallMonitor, excludedApps, noExcluded, remove, addApp, notSet, pressKeys
     case conflictTitle, conflictBody, useInstead, cancel, setupName, save, rename, reset, setupsHint
     case swapLeft, swapRight, swapUp, swapDown, makeMain, maximize, floatWin, closeWin, paused, aboutText
     case close, minimize, editMenu, cut, copy, paste, selectAll, windowMenu, animate, makeMainAction, setupSaved, slateIcon, clayIcon, layout, needMod, restartNote
@@ -102,6 +102,7 @@ enum L10n {
         .tabView: ["Tab View for stacked windows", "Vista de pestañas para ventanas apiladas", "重なったウィンドウをタブ表示", "겹친 창 탭 보기", "为堆叠窗口显示标签页"],
         .hoverActivate: ["Activate windows on hover", "Activar ventanas al pasar el ratón", "ホバーでウィンドウをアクティブ化", "마우스 오버 시 창 활성화", "悬停时激活窗口"],
         .quickActions: ["Quick actions above windows", "Acciones rápidas sobre las ventanas", "ウィンドウ上のクイックアクション", "창 위 빠른 동작", "窗口上方的快捷操作"],
+        .smallMonitor: ["Small monitor mode (Columns and Rows hold 2 windows)", "Modo pantalla pequeña (Columnas y Filas admiten 2 ventanas)", "小型モニターモード（列・行は2ウィンドウまで）", "작은 모니터 모드 (열·행은 창 2개까지)", "小屏幕模式（列和行最多 2 个窗口）"],
         .excludedApps: ["Apps that are never tiled", "Apps que nunca se organizan", "タイル表示しないアプリ", "타일링하지 않을 앱", "不平铺的应用"],
         .noExcluded: ["None", "Ninguna", "なし", "없음", "无"],
         .remove: ["Remove", "Quitar", "削除", "제거", "移除"],

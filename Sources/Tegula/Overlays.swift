@@ -89,10 +89,16 @@ private final class DimPanel: OverlayPanel {
         host.addSubview(fx); host.addSubview(tint)
         contentView = host
         alphaValue = 0
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
     }
     func fit(_ size: NSSize) {
         let r = NSRect(origin: .zero, size: size)
         host.frame = r; fx.frame = r; tint.frame = r
+    }
+    /// Window-shaped cover (used for the focus crossfade): follows the window's own corner radius.
+    func round(_ radius: CGFloat) {
+        host.wantsLayer = true
+        host.layer?.cornerRadius = radius; host.layer?.masksToBounds = true
     }
 }
 
@@ -174,6 +180,7 @@ final class Overlays {
     private var tabs: [TabPanel] = []
     private let quick = QuickPanel()
     private var dimHideWork: DispatchWorkItem?
+    var frameProvider: ((CGWindowID) -> CGRect?)?        // AX-coords frame of a tiled window, for the focus crossfade
 
     init() {
         quick.onAction = { i in
@@ -190,16 +197,16 @@ final class Overlays {
     }
 
     func hideAll() {
-        dimHideWork?.cancel()
+        dimHideWork?.cancel(); cancelCrossfade()
         (borders as [NSWindow] + dims as [NSWindow] + tabs as [NSWindow] + [quick]).forEach { $0.orderOut(nil) }
     }
 
-    func refresh(tiles: [TileInfo], active: CGWindowID?, focused: CGWindowID?, animated: Bool) {
+    func refresh(tiles: [TileInfo], active: CGWindowID?, focused: CGWindowID?, fullScreen: Bool = false, animated: Bool) {
         let s = Settings.shared
         let glide = animated && Motion.enabled
         updateBorders(tiles, active, s, glide)
         updateTabs(tiles, active, s, glide)
-        updateDim(focused, s)
+        if !dimsSuppressed { updateDim(focused, s) }
         updateQuick(tiles, active, s)
     }
 
@@ -258,6 +265,108 @@ final class Overlays {
 
     // MARK: focus dim (blur + darken, eased in and out)
 
+    /// Cheap, immediate re-stack of the dimmer just under the focused window. macOS reshuffles window order at the
+    /// end of a Space transition (e.g. leaving full screen); without this, other windows show undimmed for a beat.
+    func reassertDimOrder(below f: CGWindowID?) {
+        guard let f = f, Settings.shared.focusMode != .off, !dimsSuppressed, !crossfading else { return }
+        for p in dims where p.isVisible && p.alphaValue > 0 { p.order(.below, relativeTo: Int(f)) }
+    }
+
+    /// While a native full-screen app is frontmost the dimmer can't be stacked under it (it lives in another Space),
+    /// so it would darken the very app you are using: it is switched off entirely. It fades out as the app enters
+    /// full screen and fades back in over the same time as macOS's own animation when the app leaves it.
+    static let fullScreenFade: TimeInterval = 0.5     // dimmer fading out as an app enters full screen
+    static let resumeFade: TimeInterval = 0.8         // dimmer fading back in once the app is back in its layout
+    static let switchFade: TimeInterval = 0.35        // focus moving between two tiled windows (a tad quicker)
+    static let evenCurve = CAMediaTimingFunction(name: .easeInEaseOut)   // spreads the fade across the whole OS animation
+    private(set) var dimsSuppressed = false
+    private var dimResuming = false
+    private var dimFadeEnd = Date.distantPast
+    func suppressDims(_ on: Bool) {
+        guard on != dimsSuppressed else { return }
+        dimsSuppressed = on
+        cancelCrossfade(); lastFocused = nil
+        if on { dimHideWork?.cancel(); dimHideWork = nil; fadeOutDims(Overlays.fullScreenFade) }
+        else { dimResuming = true }
+    }
+
+    // MARK: focus crossfade
+    // The dimmer sits under the focused window, so moving focus would snap the old window dark and the new one
+    // bright. Instead, while the dimmer stays under the OLD window, a window-shaped cover over the new window starts
+    // dark and fades out, and one over the old window fades in; then the dimmer moves under the new window,
+    // which looks identical, so the hand-over is invisible.
+    private var lastFocused: CGWindowID?
+    private var crossTarget: CGWindowID?
+    private var crossEpoch = 0
+    private var crossfading: Bool { crossTarget != nil }
+    private lazy var coverOld = DimPanel()
+    private lazy var coverNew = DimPanel()
+
+    /// Window-shaped covers at floating level: unlike ordinary windows they stay above the newly focused window
+    /// even after the OS raises it, so there is no frame where it shows bright.
+    private func placeCovers(from a: CGWindowID, to b: CGWindowID) -> Bool {
+        guard let fa = frameProvider?(a), let fb = frameProvider?(b) else { return false }
+        let tint: CGFloat = Settings.shared.focusMode == .noPeek ? 0.30 : 0.58
+        let blur: CGFloat = Settings.shared.focusMode == .noPeek ? 1 : 0
+        func prep(_ p: DimPanel, _ ax: CGRect, alpha: CGFloat) {
+            let r = Geo.flip(ax)
+            if p.frame != r { p.setFrame(r, display: false); p.fit(r.size) }
+            p.level = .floating; p.round(18)
+            p.tint.alphaValue = tint; p.fx.alphaValue = blur; p.alphaValue = alpha
+            p.orderFrontRegardless()
+        }
+        prep(coverNew, fb, alpha: 1)
+        prep(coverOld, fa, alpha: 0)
+        return true
+    }
+
+    private var preTarget: CGWindowID?, preOld: CGWindowID?
+    private var preWork: DispatchWorkItem?
+
+    /// Called on mouse-down over another tiled window, before macOS has even focused it: the new window's cover is
+    /// already in place (dark) when the focus change lands, so it never flashes bright.
+    func precover(new b: CGWindowID, old a: CGWindowID?) {
+        guard let a = a, a != b, Settings.shared.focusMode != .off, !dimsSuppressed, !crossfading, Motion.enabled,
+              dims.contains(where: { $0.isVisible && $0.alphaValue > 0.99 }), placeCovers(from: a, to: b) else { return }
+        preTarget = b; preOld = a
+        preWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in   // the click didn't move focus: put things back as they were
+            guard let self = self, !self.crossfading, self.preTarget == b else { return }
+            self.preTarget = nil; self.coverOld.orderOut(nil); self.coverNew.orderOut(nil)
+        }
+        preWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: w)
+    }
+
+    private func crossfade(from a: CGWindowID, to b: CGWindowID, tint: CGFloat, blur: CGFloat) -> Bool {
+        let pre = preTarget == b && preOld == a
+        preWork?.cancel(); preTarget = nil; preOld = nil
+        finishCrossfade()
+        if !pre && !placeCovers(from: a, to: b) { return false }
+        crossEpoch += 1; let epoch = crossEpoch; crossTarget = b
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = Overlays.switchFade; ctx.timingFunction = Overlays.evenCurve
+            coverNew.animator().alphaValue = 0
+            coverOld.animator().alphaValue = 1
+        }, completionHandler: { [weak self] in
+            guard let self = self, self.crossEpoch == epoch else { return }
+            self.finishCrossfade()
+        })
+        return true
+    }
+
+    private func finishCrossfade() {
+        guard let b = crossTarget else { return }
+        crossTarget = nil; crossEpoch += 1
+        for p in dims where p.isVisible && p.alphaValue > 0 { p.order(.below, relativeTo: Int(b)) }
+        coverOld.orderOut(nil); coverNew.orderOut(nil)
+    }
+
+    private func cancelCrossfade() {
+        crossTarget = nil; crossEpoch += 1; preTarget = nil; preWork?.cancel()
+        coverOld.orderOut(nil); coverNew.orderOut(nil)
+    }
+
     private func updateDim(_ focused: CGWindowID?, _ s: Settings) {
         guard s.focusMode != .off else { dimHideWork?.cancel(); fadeOutDims(0.3); return }
         guard let f = focused else {
@@ -275,6 +384,16 @@ final class Overlays {
         // Dim Others: darker only, no blur. No Peek: blurred and darkened.
         let blur: CGFloat = s.focusMode == .noPeek ? 1 : 0
         let tint: CGFloat = s.focusMode == .noPeek ? 0.30 : 0.58
+        let resuming = dimResuming; dimResuming = false
+        let fade = resuming ? Overlays.resumeFade : 0.55
+        if resuming { dimFadeEnd = Date().addingTimeInterval(fade) }
+        let fading = Date() < dimFadeEnd   // a later refresh must not restart (and speed up) a fade that is under way
+        var hold = crossfading
+        if let last = lastFocused, last != f, !resuming, !fading, Motion.enabled,
+           dims.contains(where: { $0.isVisible && $0.alphaValue > 0.99 }) {
+            hold = crossfade(from: last, to: f, tint: tint, blur: blur)
+        }
+        lastFocused = f
         for (i, p) in dims.enumerated() {
             guard i < screens.count else { p.orderOut(nil); continue }
             if p.frame != screens[i].frame {
@@ -283,10 +402,12 @@ final class Overlays {
             }
             let fresh = !p.isVisible
             if fresh { p.alphaValue = 0; p.tint.alphaValue = tint; p.fx.alphaValue = blur }
-            p.order(.below, relativeTo: Int(f))
-            if p.alphaValue < 1 || p.tint.alphaValue != tint || p.fx.alphaValue != blur {
+            if hold && !fresh { continue }   // a focus crossfade owns the stacking until it finishes
+            p.order(.below, relativeTo: Int(f)); Log.d("dim ordered below \(f)")
+            if !fading && (p.alphaValue < 1 || p.tint.alphaValue != tint || p.fx.alphaValue != blur) || (resuming && fresh) {
                 NSAnimationContext.runAnimationGroup { ctx in
-                    ctx.duration = fresh ? 0.55 : 0.3; ctx.timingFunction = Motion.curve
+                    ctx.duration = fresh ? fade : 0.3
+                    ctx.timingFunction = resuming ? Overlays.evenCurve : Motion.curve
                     p.animator().alphaValue = 1
                     p.tint.animator().alphaValue = tint
                     p.fx.animator().alphaValue = blur
@@ -298,7 +419,7 @@ final class Overlays {
     private func fadeOutDims(_ d: TimeInterval) {
         for p in dims where p.isVisible && p.alphaValue > 0 {
             NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = d; ctx.timingFunction = Motion.curve
+                ctx.duration = d; ctx.timingFunction = d == Overlays.fullScreenFade ? Overlays.evenCurve : Motion.curve
                 p.animator().alphaValue = 0
             }, completionHandler: { if p.alphaValue == 0 { p.orderOut(nil) } })
         }

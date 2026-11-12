@@ -245,6 +245,7 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
             [NSView(), check(L10n.t(.tabView), s.tabView) { s.tabView = $0 }],
             [NSView(), check(L10n.t(.hoverActivate), s.hoverActivate) { s.hoverActivate = $0 }],
             [NSView(), check(L10n.t(.quickActions), s.quickActions) { s.quickActions = $0 }],
+            [NSView(), check(L10n.t(.smallMonitor), s.smallMonitor) { s.smallMonitor = $0 }],
             [label(L10n.t(.excludedApps)), box],
         ])
     }

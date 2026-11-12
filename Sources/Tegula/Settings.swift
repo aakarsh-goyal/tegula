@@ -61,6 +61,8 @@ final class Settings {
     var animate: Bool { get { flag("animate", true) } set { put(newValue, "animate") } }
     var tabView: Bool { get { flag("tabView", true) } set { put(newValue, "tabView") } }
     var hoverActivate: Bool { get { flag("hoverActivate", false) } set { put(newValue, "hoverActivate") } }
+    /// Small monitor mode: Columns and Rows hold at most two windows; a newer window replaces the least recently used one.
+    var smallMonitor: Bool { get { flag("smallMonitor", false) } set { put(newValue, "smallMonitor") } }
     var quickActions: Bool { get { flag("quickActions", false) } set { put(newValue, "quickActions") } }
     var theme: ThemeMode { get { ThemeMode(rawValue: d.string(forKey: "theme") ?? "") ?? .system } set { put(newValue.rawValue, "theme") } }
     var language: String { get { d.string(forKey: "language") ?? "system" } set { put(newValue, "language") } }
