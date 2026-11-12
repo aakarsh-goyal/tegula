@@ -178,6 +178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .tileApp:
             if let app = NSWorkspace.shared.frontmostApplication, let b = app.bundleIdentifier { t.toggleTile(bundle: b) }
         case .makeMain: t.makeMain()
+        case .maximize: t.toggleMaximize()
         case nil: break
         }
     }

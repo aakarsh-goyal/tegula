@@ -253,7 +253,7 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         recorders.removeAll()
         let names: [Action: S] = [.layoutGrid: .grid, .layoutColumns: .columns, .layoutRows: .rows, .layoutSide: .side, .pause: .pause,
                                   .swapLeft: .swapLeft, .swapRight: .swapRight, .swapUp: .swapUp, .swapDown: .swapDown,
-                                  .cleanSpace: .cleanSpace, .focusToggle: .focus, .retile: .retile, .tileApp: .tileApp, .makeMain: .makeMain]
+                                  .cleanSpace: .cleanSpace, .focusToggle: .focus, .retile: .retile, .tileApp: .tileApp, .makeMain: .makeMain, .maximize: .maximize]
         var rows: [[NSView]] = []
         for a in Action.allCases {
             let r = ShortcutRecorder(action: a.rawValue)

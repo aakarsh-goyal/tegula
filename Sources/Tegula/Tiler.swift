@@ -47,6 +47,8 @@ final class Tiler {
     private var userFloating = Set<CGWindowID>()
     private(set) var activeID: CGWindowID?                  // focused AND tiled
     private(set) var focusedRaw: CGWindowID?                // focused window, tiled or not
+    private var maximized: [String: CGWindowID] = [:]      // per display: the tiled window currently filling the screen
+    private var freeMax: [CGWindowID: CGRect] = [:]         // restore frames for maximized windows we don't tile
     private var mru: [CGWindowID] = []                       // window ids, most recently active first
     private var lastActive: [pid_t: CGWindowID] = [:]       // per app: last tiled window that was active
 
@@ -254,14 +256,24 @@ final class Tiler {
         if pendingSetup != nil { applyPendingSetup() }
     }
 
+    /// Columns and Rows hold at most two windows side by side; anything beyond that stacks behind a tile.
     private func capacity(_ key: String) -> Int {
-        ScreenInfo.all().first { $0.key == key }?.capacity ?? 4
+        if [.columns, .rows].contains(Settings.shared.layout(for: key)) { return 2 }
+        return ScreenInfo.all().first { $0.key == key }?.capacity ?? 4
     }
+
+    /// Rank of a tile = its most recently used window (lower = more recent).
+    private func tileRank(_ t: [CGWindowID]) -> Int { t.map(rank).min() ?? Int.max }
 
     private func place(_ tw: TWin) {
         var t = tiles[tw.display] ?? []
         if t.count < capacity(tw.display) {
             t.append([tw.id])
+        } else if [.columns, .rows].contains(Settings.shared.layout(for: tw.display)) {
+            // Two-window layouts: the new window takes the tile of the least recently used window,
+            // which stacks behind it. The most recently used window keeps its place.
+            let idx = t.indices.max { tileRank(t[$0]) < tileRank(t[$1]) } ?? t.count - 1
+            t[idx].append(tw.id)
         } else {
             let idx = activeID.flatMap { a in t.firstIndex { $0.contains(a) } } ?? t.count - 1
             t[idx].append(tw.id)
@@ -277,11 +289,21 @@ final class Tiler {
         }
         minSizes[id] = nil
         mru.removeAll { $0 == id }
+        for k in maximized.keys where maximized[k] == id { maximized[k] = nil }
         dirty.insert(tw.display)
     }
 
     private func rebalance(_ t: inout [[CGWindowID]], cap: Int) {
-        while t.count > cap, t.count > 1 { let x = t.removeLast(); t[t.count - 1] += x }
+        while t.count > cap, t.count > 1 {
+            // stack the least recently used tile behind the next-least-recent one
+            let order = t.indices.sorted { a, b in
+                let ra = tileRank(t[a]), rb = tileRank(t[b])
+                return ra != rb ? ra > rb : a > b
+            }
+            let victim = order[0], host = order[1]
+            t[host] = (t[host] + t[victim]).sorted { rank($0) > rank($1) }
+            t.remove(at: victim)
+        }
         while t.count < cap, let i = t.firstIndex(where: { $0.count > 1 }) {
             t.append([t[i].removeFirst()])
         }
@@ -322,7 +344,8 @@ final class Tiler {
             Log.d("retile adopts orphan win=\(tw.id) bundle=\(tw.bundle)")
             work.append([tw.id])
         }
-        rebalance(&work, cap: scr.capacity)
+        rebalance(&work, cap: capacity(key))
+        if let m = maximized[key], !work.contains(where: { $0.contains(m) }) { maximized[key] = nil }
         guard !work.isEmpty else { tiles[key] = []; tileRects[key] = []; return }
 
         let gap = set.gap
@@ -341,7 +364,6 @@ final class Tiler {
             // Won't fit. Rather than float a window over its neighbours, stack the least recently used tile
             // behind another one: the windows you used last keep their own, fully visible tiles.
             if work.count > 1 {
-                func tileRank(_ t: [CGWindowID]) -> Int { t.map(rank).min() ?? Int.max }
                 let order = work.indices.sorted { tileRank(work[$0]) > tileRank(work[$1]) }   // oldest first
                 let victim = order[0], host = order[1]
                 Log.d("retile stacks stale tile \(work[victim]) behind \(work[host])")
@@ -374,6 +396,11 @@ final class Tiler {
             if ids.count > 1 && strip > 0 { r.origin.y += strip; r.size.height -= strip }
             let right = rects[i].maxX >= avail.maxX - 0.5, bottom = rects[i].maxY >= avail.maxY - 0.5
             for id in ids {
+                if id == maximized[key] {   // fills the screen; the rest stay arranged in the layout behind it
+                    wins[id]?.anchorRight = true; wins[id]?.anchorBottom = true
+                    apply(id, avail, display: key, animated: animated)
+                    continue
+                }
                 wins[id]?.anchorRight = right; wins[id]?.anchorBottom = bottom
                 apply(id, r, display: key, animated: animated)
             }
@@ -472,6 +499,10 @@ final class Tiler {
     private func publish(animated: Bool = false) {
         var infos: [TileInfo] = []
         for (key, list) in tiles {
+            if let m = maximized[key], wins[m] != nil, let scr = ScreenInfo.all().first(where: { $0.key == key }) {
+                infos.append(TileInfo(key: key, index: 0, rect: scr.usable.insetBy(dx: Settings.shared.gap, dy: Settings.shared.gap), ids: [m]))
+                continue
+            }
             let rects = tileRects[key] ?? []
             for (i, ids) in list.enumerated() where i < rects.count {
                 infos.append(TileInfo(key: key, index: i, rect: rects[i], ids: ids))
@@ -501,6 +532,10 @@ final class Tiler {
         focusedRaw = raw
         activeID = candidate
         if let a = candidate, mru.first != a { mru.removeAll { $0 == a }; mru.insert(a, at: 0) }
+        // Focusing any other window on a display ends its maximized state.
+        if let a = candidate, let d = wins[a]?.display, let m = maximized[d], m != a {
+            maximized[d] = nil; dirty.insert(d); scheduleRetileAll()
+        }
         if let a = activeID {   // keep the focused window on top of its stack
             for key in tiles.keys {
                 guard var t = tiles[key], let i = t.firstIndex(where: { $0.contains(a) }) else { continue }
@@ -607,6 +642,9 @@ final class Tiler {
     }
 
     func swapInDirection(_ dx: Int, _ dy: Int) {
+        var (dx, dy) = (dx, dy)
+        // In Rows there is no left or right: ← / → move the window up / down instead.
+        if dx != 0, let a = activeID, let l = locate(a), Settings.shared.layout(for: l.key) == .rows, (tiles[l.key]?.count ?? 0) > 1 { dy = dx; dx = 0 }
         guard running, let id = activeID, let loc = locate(id), let rects = tileRects[loc.key], loc.tile < rects.count else {
             Log.d("swap(\(dx),\(dy)) ignored: running=\(running) active=\(String(describing: activeID)) located=\(activeID.flatMap { locate($0) } != nil)")
             return
@@ -645,6 +683,30 @@ final class Tiler {
     func makeMain(_ id: CGWindowID? = nil) {
         guard let id = id ?? activeID, let loc = locate(id), let main = tiles[loc.key]?.first?.last, main != id else { return }
         swap(id, main); flush(); focus(id)
+    }
+
+    /// ⌃⌥↩: fills the screen with the active window, whether or not tiling is running. While tiling runs, the
+    /// other windows keep their places in the active layout behind it; press again (or focus another window) to restore.
+    func toggleMaximize() {
+        guard let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() else { return }
+        let ax = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(ax, 0.3)
+        let el = ax.element(kAXFocusedWindowAttribute) ?? ax.element(kAXMainWindowAttribute)
+        let raw = el?.windowID
+        if running, let id = [raw, activeID].compactMap({ $0 }).first(where: { wins[$0] != nil }), let tw = wins[id] {
+            maximized[tw.display] = maximized[tw.display] == id ? nil : id
+            dirty.insert(tw.display); flush()
+            return
+        }
+        // Not tiled (paused, excluded app, Stage Manager…): plain maximize / restore.
+        guard let el = el, let id = raw, el.bool("AXFullScreen") != true else { return }
+        if let prev = freeMax.removeValue(forKey: id) { el.setFrame(prev); return }
+        guard let f = el.frame else { return }
+        let screens = ScreenInfo.all()
+        let c = CGPoint(x: f.midX, y: f.midY)
+        guard let scr = screens.first(where: { $0.full.contains(c) }) ?? screens.first else { return }
+        freeMax[id] = f
+        el.setFrame(scr.usable.insetBy(dx: Settings.shared.gap, dy: Settings.shared.gap))
     }
 
     func floatWindow(_ id: CGWindowID) {

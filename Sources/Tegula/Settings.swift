@@ -135,7 +135,7 @@ extension NSColor {
 enum Action: String, CaseIterable {
     case layoutGrid, layoutColumns, layoutRows, layoutSide
     case pause, swapLeft, swapRight, swapUp, swapDown
-    case cleanSpace, focusToggle, retile, tileApp, makeMain
+    case cleanSpace, focusToggle, retile, tileApp, makeMain, maximize
 
     var defaultShortcut: Shortcut? {
         let cac = UInt32(controlKey | optionKey | cmdKey), ca = UInt32(controlKey | optionKey)
@@ -154,6 +154,7 @@ enum Action: String, CaseIterable {
         case .retile:        return Shortcut(keyCode: 15, mods: cac, label: "R")
         case .tileApp:       return Shortcut(keyCode: 17, mods: cac, label: "T")
         case .makeMain:      return Shortcut(keyCode: 46, mods: cac, label: "M")
+        case .maximize:      return Shortcut(keyCode: 36, mods: ca, label: "↩")
         }
     }
 }

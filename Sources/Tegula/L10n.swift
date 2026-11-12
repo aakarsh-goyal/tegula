@@ -9,7 +9,7 @@ enum S: String {
     case appIcon, launchAtLogin, borderStyle, borderNone, borderActive, borderAll, borderGlow, borderColor
     case tabView, hoverActivate, quickActions, excludedApps, noExcluded, remove, addApp, notSet, pressKeys
     case conflictTitle, conflictBody, useInstead, cancel, setupName, save, rename, reset, setupsHint
-    case swapLeft, swapRight, swapUp, swapDown, makeMain, floatWin, closeWin, paused, aboutText
+    case swapLeft, swapRight, swapUp, swapDown, makeMain, maximize, floatWin, closeWin, paused, aboutText
     case close, minimize, editMenu, cut, copy, paste, selectAll, windowMenu, animate, makeMainAction, setupSaved, slateIcon, clayIcon, layout, needMod, restartNote
 }
 
@@ -128,6 +128,7 @@ enum L10n {
         .swapUp: ["Swap with above", "Intercambiar con la de arriba", "上と入れ替え", "위와 교체", "与上方交换"],
         .swapDown: ["Swap with below", "Intercambiar con la de abajo", "下と入れ替え", "아래와 교체", "与下方交换"],
         .makeMain: ["Make main window", "Hacer ventana principal", "メインにする", "메인 창으로 만들기", "设为主窗口"],
+        .maximize: ["Maximize window", "Maximizar ventana", "ウィンドウを最大化", "창 최대화", "最大化窗口"],
         .makeMainAction: ["Make main window", "Hacer ventana principal", "メインにする", "메인 창으로 만들기", "设为主窗口"],
         .floatWin: ["Float window", "Liberar ventana", "フロートにする", "창 띄우기", "浮动窗口"],
         .closeWin: ["Close window", "Cerrar ventana", "ウィンドウを閉じる", "창 닫기", "关闭窗口"],
