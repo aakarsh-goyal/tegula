@@ -89,7 +89,7 @@ private final class DimPanel: OverlayPanel {
         host.addSubview(fx); host.addSubview(tint)
         contentView = host
         alphaValue = 0
-        collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        collectionBehavior = [.canJoinAllSpaces, .transient, .ignoresCycle]   // transient: macOS hides it during Mission Control, App Exposé and Show Desktop
     }
     func fit(_ size: NSSize) {
         let r = NSRect(origin: .zero, size: size)
@@ -201,7 +201,7 @@ final class Overlays {
         (borders as [NSWindow] + dims as [NSWindow] + tabs as [NSWindow] + [quick]).forEach { $0.orderOut(nil) }
     }
 
-    func refresh(tiles: [TileInfo], active: CGWindowID?, focused: CGWindowID?, fullScreen: Bool = false, animated: Bool) {
+    func refresh(tiles: [TileInfo], active: CGWindowID?, focused: CGWindowID?, animated: Bool) {
         let s = Settings.shared
         let glide = animated && Motion.enabled
         updateBorders(tiles, active, s, glide)
@@ -317,6 +317,9 @@ final class Overlays {
         }
         prep(coverNew, fb, alpha: 1)
         prep(coverOld, fa, alpha: 0)
+        // Move the dimmer just under the new window right away. Its cover now does the dimming, so the new window is
+        // dimmed exactly once whether or not macOS has raised it yet (otherwise: one double-dark frame).
+        for p in dims where p.isVisible && p.alphaValue > 0 { p.order(.below, relativeTo: Int(b)) }
         return true
     }
 
@@ -332,7 +335,9 @@ final class Overlays {
         preWork?.cancel()
         let w = DispatchWorkItem { [weak self] in   // the click didn't move focus: put things back as they were
             guard let self = self, !self.crossfading, self.preTarget == b else { return }
-            self.preTarget = nil; self.coverOld.orderOut(nil); self.coverNew.orderOut(nil)
+            self.preTarget = nil
+            for p in self.dims where p.isVisible && p.alphaValue > 0 { p.order(.below, relativeTo: Int(a)) }
+            self.coverOld.orderOut(nil); self.coverNew.orderOut(nil)
         }
         preWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: w)
@@ -403,7 +408,7 @@ final class Overlays {
             let fresh = !p.isVisible
             if fresh { p.alphaValue = 0; p.tint.alphaValue = tint; p.fx.alphaValue = blur }
             if hold && !fresh { continue }   // a focus crossfade owns the stacking until it finishes
-            p.order(.below, relativeTo: Int(f)); Log.d("dim ordered below \(f)")
+            p.order(.below, relativeTo: Int(f))
             if !fading && (p.alphaValue < 1 || p.tint.alphaValue != tint || p.fx.alphaValue != blur) || (resuming && fresh) {
                 NSAnimationContext.runAnimationGroup { ctx in
                     ctx.duration = fresh ? fade : 0.3

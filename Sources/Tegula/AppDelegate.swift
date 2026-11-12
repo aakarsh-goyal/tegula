@@ -77,6 +77,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
             listen("com.aakarsh.tegula.dump") { Tiler.shared.debugDump() }
+            // Runs what a mouse-down on the other tile does (focus-dim pre-cover), without touching the mouse.
+            listen("com.aakarsh.tegula.precover") { Tiler.shared.debugPrecoverOther() }
             // Posts ⌘W, but ONLY when one of our own windows is key, so it can never close another app's window.
             listen("com.aakarsh.tegula.cmdw") {
                 guard NSApp.isActive, NSApp.keyWindow != nil else { Log.d("cmdw skipped: Tegula window not key"); return }

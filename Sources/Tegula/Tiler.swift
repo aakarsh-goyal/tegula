@@ -160,7 +160,6 @@ final class Tiler {
 
     fileprivate func axEvent(_ el: AXUIElement, _ note: String) {
         guard started, !Settings.shared.paused else { return }
-        Log.d("ax \(note) pid=\(el.pid)")
         switch note {
         case kAXFocusedWindowChangedNotification: refreshActive()
         case kAXWindowMovedNotification, kAXWindowResizedNotification: geometryChanged(el)
@@ -566,7 +565,6 @@ final class Tiler {
     }
 
     func refreshActive(draw: Bool = true) {
-        Log.d("refreshActive draw=\(draw)")
         var raw: CGWindowID?
         var candidate: CGWindowID?
         var fullScreen = false
@@ -842,6 +840,14 @@ final class Tiler {
         } else if !want, let m = clickMonitor {
             NSEvent.removeMonitor(m); clickMonitor = nil
         }
+    }
+
+    /// Debug only: what a mouse-down on the other tile would do, without touching the mouse.
+    func debugPrecoverOther() {
+        guard let f = focusedRaw, let d = wins[f]?.display,
+              let other = tiles[d]?.compactMap({ $0.last }).first(where: { $0 != f }) else { Log.d("precover: no other tile"); return }
+        Log.d("debug precover \(other) (focused \(f))")
+        Overlays.shared.precover(new: other, old: f)
     }
 
     private func clickDown() {
