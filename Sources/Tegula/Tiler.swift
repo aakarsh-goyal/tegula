@@ -706,14 +706,25 @@ final class Tiler {
         var (dx, dy) = (dx, dy)
         // In Rows there is no left or right: ← / → move the window up / down instead.
         if dx != 0, let a = activeID, let l = locate(a), Settings.shared.layout(for: l.key) == .rows, (tiles[l.key]?.count ?? 0) > 1 { dy = dx; dx = 0 }
+        // Maximized while tiling was off: any arrow puts the window back.
+        if !running || activeID.flatMap({ locate($0) }) == nil,
+           let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() {
+            let ax = AXUIElementCreateApplication(app.processIdentifier)
+            if let el = ax.element(kAXFocusedWindowAttribute) ?? ax.element(kAXMainWindowAttribute), let wid = el.windowID,
+               let prev = freeMax.removeValue(forKey: wid) { el.setFrame(prev); return }
+        }
         guard running, let id = activeID, let loc = locate(id), let rects = tileRects[loc.key], loc.tile < rects.count else {
             Log.d("swap(\(dx),\(dy)) ignored: running=\(running) active=\(String(describing: activeID)) located=\(activeID.flatMap { locate($0) } != nil)")
             return
         }
         Log.d("swap(\(dx),\(dy)) win=\(id) tile=\(loc.tile) of \(rects.count) on \(loc.key.prefix(8))")
-        // A maximized window: the arrow returns it to the layout, moving toward that side if there's a tile there.
-        let wasMaximized = maximized[loc.key] == id
-        if wasMaximized { maximized[loc.key] = nil; dirty.insert(loc.key) }
+        // A maximized window: any arrow just returns it to its own tile in the layout.
+        if maximized[loc.key] == id {
+            maximized[loc.key] = nil; dirty.insert(loc.key)
+            Log.d("unmaximize win=\(id)")
+            flush(); focus(id)
+            return
+        }
         let me = rects[loc.tile]
         let c = CGPoint(x: me.midX, y: me.midY)
         var best: (Int, CGFloat)?
@@ -727,8 +738,6 @@ final class Tiler {
         }
         if let (i, _) = best, let other = tiles[loc.key]?[i].last {
             swap(id, other)
-        } else if wasMaximized {
-            // already on that side: restoring is all that was asked
         } else {
             // past the screen edge: hop to the neighbouring display
             let screens = ScreenInfo.all()
@@ -752,7 +761,7 @@ final class Tiler {
     }
 
     /// ⌃⌥↩: fills the screen with the active window, whether or not tiling is running. While tiling runs, the
-    /// other windows keep their places in the active layout behind it; it stays maximized, even when other windows take focus, until you press ⌃⌥↩ again or ⌃⌥←/→.
+    /// other windows keep their places in the active layout behind it; it stays maximized, even when other windows take focus, until you press one of the ⌃⌥ arrow keys.
     func toggleMaximize() {
         guard let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() else { return }
         let ax = AXUIElementCreateApplication(app.processIdentifier)
@@ -760,14 +769,15 @@ final class Tiler {
         let el = ax.element(kAXFocusedWindowAttribute) ?? ax.element(kAXMainWindowAttribute)
         let raw = el?.windowID
         if running, let id = [raw, activeID].compactMap({ $0 }).first(where: { wins[$0] != nil }), let tw = wins[id] {
-            maximized[tw.display] = maximized[tw.display] == id ? nil : id
+            maximized[tw.display] = id   // never a toggle: ⌃⌥↩ always maximizes, the arrows restore
+            Log.d("maximize win=\(id) display=\(tw.display.prefix(8))")
             dirty.insert(tw.display); flush()
+            focus(id)
             return
         }
         // Not tiled (paused, excluded app, Stage Manager…): plain maximize / restore.
         guard let el = el, let id = raw, el.bool("AXFullScreen") != true else { return }
-        if let prev = freeMax.removeValue(forKey: id) { el.setFrame(prev); return }
-        guard let f = el.frame else { return }
+        guard let f = freeMax[id] == nil ? el.frame : freeMax[id] else { return }   // already maximized: keep the original restore frame
         let screens = ScreenInfo.all()
         let c = CGPoint(x: f.midX, y: f.midY)
         guard let scr = screens.first(where: { $0.full.contains(c) }) ?? screens.first else { return }
